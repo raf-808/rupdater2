@@ -9,11 +9,16 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 func Run(ctx context.Context, opts Options) error {
 	rootDir, exePath, err := resolveRuntimePaths(opts)
+	if err != nil {
+		return err
+	}
+	stateDir, err := resolveStateDir(rootDir, opts.StateDir)
 	if err != nil {
 		return err
 	}
@@ -28,27 +33,51 @@ func Run(ctx context.Context, opts Options) error {
 		opts.Client = defaultHTTPClient()
 	}
 
-	if opts.CompleteSelfUpdate {
-		return completeSelfUpdate(rootDir, opts.SelfUpdateTarget, opts.SelfUpdatePending, ui)
-	}
-	if err := maybeHandoffSelfUpdate(rootDir, opts, ui); err != nil {
-		return err
-	}
-	if err := recoverIfNeeded(rootDir, ui); err != nil {
-		return err
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	if setter, ok := ui.(CancelSetter); ok {
+		setter.SetCancel(cancel)
 	}
 
+	work := func(ctx context.Context) error {
+		if opts.CompleteSelfUpdate {
+			return completeSelfUpdate(rootDir, opts.SelfUpdateTarget, opts.SelfUpdatePending, ui)
+		}
+		if err := maybeHandoffSelfUpdate(rootDir, opts, ui); err != nil {
+			return err
+		}
+		if err := recoverIfNeeded(stateDir, rootDir, ui); err != nil {
+			return err
+		}
+		return runUpdate(ctx, rootDir, stateDir, exePath, opts, ui)
+	}
+
+	if runner, ok := ui.(GUIRunner); ok {
+		return runner.RunMessageLoop(work, ctx)
+	}
+	return work(ctx)
+}
+
+func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Options, ui UI) error {
 	version := VersionState{}
-	_, err = readOptionalJSON(statePath(rootDir, "version.json"), &version)
-	if err != nil {
+	_, err := readOptionalJSON(filepath.Join(stateDir, "version.json"), &version)
+	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("读取本地版本失败：%w", err)
 	}
 
 	config := Config{}
-	if ok, err := readOptionalJSON(statePath(rootDir, "config.json"), &config); err != nil {
+	if ok, err := readOptionalJSON(filepath.Join(stateDir, "config.json"), &config); err != nil {
 		return fmt.Errorf("读取配置失败：%w", err)
 	} else if !ok || !validURL(config.LatestURL) {
-		return fmt.Errorf("配置缺失或非法：%s", statePath(rootDir, "config.json"))
+		ui.ShowVersionInfo(version.Version, "未知")
+		ui.Info("未找到可用配置，界面已启动。")
+		return ErrMissingConfig
+	}
+
+	if err := ctx.Err(); err != nil {
+		cleanupBeforeRootChange(stateDir)
+		return ErrUserCancelled
 	}
 
 	latest := LatestInfo{}
@@ -59,8 +88,14 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("latest.json 缺少必要字段")
 	}
 	if latest.Version == version.Version {
+		ui.ShowVersionInfo(version.Version, latest.Version)
 		ui.Info("当前已经是最新版本。")
 		return ErrNoUpdate
+	}
+
+	if err := ctx.Err(); err != nil {
+		cleanupBeforeRootChange(stateDir)
+		return ErrUserCancelled
 	}
 
 	remoteManifest := Manifest{}
@@ -73,10 +108,15 @@ func Run(ctx context.Context, opts Options) error {
 
 	var installed *Manifest
 	installedManifest := Manifest{}
-	if ok, err := readOptionalJSON(statePath(rootDir, "installed_manifest.json"), &installedManifest); err != nil {
+	if ok, err := readOptionalJSON(filepath.Join(stateDir, "installed_manifest.json"), &installedManifest); err != nil {
 		return fmt.Errorf("读取已安装清单失败：%w", err)
 	} else if ok {
 		installed = &installedManifest
+	}
+
+	if err := ctx.Err(); err != nil {
+		cleanupBeforeRootChange(stateDir)
+		return ErrUserCancelled
 	}
 
 	plan, err := CompareManifests(rootDir, installed, remoteManifest)
@@ -92,40 +132,70 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	if len(plan.Add) == 0 && len(plan.Modify) == 0 && len(plan.Delete) == 0 {
 		ui.Info("文件已与最新清单一致，正在提交版本状态。")
-		return commit(rootDir, remoteManifest, latest.Version)
+		return commit(stateDir, remoteManifest, latest.Version)
 	}
 	if !ui.ConfirmPlan(plan) {
 		return ErrUserCancelled
 	}
 
 	session := newSession(plan)
-	if err := writeSession(rootDir, session, "Plan"); err != nil {
+	if err := writeSession(stateDir, session, "Plan"); err != nil {
 		return err
 	}
-	if err := stageFiles(ctx, rootDir, latest.FilesBaseURL, opts.Client, opts.Workers, plan, ui); err != nil {
-		cleanupBeforeRootChange(rootDir)
+
+	if err := ctx.Err(); err != nil {
+		cleanupBeforeRootChange(stateDir)
+		return ErrUserCancelled
+	}
+
+	if err := stageFiles(ctx, rootDir, stateDir, latest.FilesBaseURL, opts.Client, opts.Workers, plan, ui); err != nil {
+		cleanupBeforeRootChange(stateDir)
 		return err
 	}
-	if err := writeSession(rootDir, session, "OccupancyCheck"); err != nil {
+	if err := writeSession(stateDir, session, "OccupancyCheck"); err != nil {
 		return err
 	}
+
+	if err := ctx.Err(); err != nil {
+		cleanupBeforeRootChange(stateDir)
+		return ErrUserCancelled
+	}
+
 	if err := occupancyCheck(rootDir, plan, exePath, ui); err != nil {
-		cleanupBeforeRootChange(rootDir)
+		cleanupBeforeRootChange(stateDir)
 		return err
 	}
-	if err := backupFiles(rootDir, plan, exePath, &session, ui); err != nil {
-		_ = recoverFromSession(rootDir, session, ui)
+
+	if err := ctx.Err(); err != nil {
+		cleanupBeforeRootChange(stateDir)
+		return ErrUserCancelled
+	}
+
+	if err := backupFiles(rootDir, stateDir, plan, exePath, &session, ui); err != nil {
+		_ = recoverFromSession(stateDir, rootDir, session, ui)
 		return err
 	}
-	if err := switchFiles(rootDir, plan, exePath, &session, ui); err != nil {
-		_ = recoverFromSession(rootDir, session, ui)
+
+	if err := ctx.Err(); err != nil {
+		_ = recoverFromSession(stateDir, rootDir, session, ui)
+		return ErrUserCancelled
+	}
+
+	if err := switchFiles(rootDir, stateDir, plan, exePath, &session, ui); err != nil {
+		_ = recoverFromSession(stateDir, rootDir, session, ui)
 		return err
 	}
-	if err := commit(rootDir, remoteManifest, latest.Version); err != nil {
-		_ = recoverFromSession(rootDir, session, ui)
+
+	if err := ctx.Err(); err != nil {
+		_ = recoverFromSession(stateDir, rootDir, session, ui)
+		return ErrUserCancelled
+	}
+
+	if err := commit(stateDir, remoteManifest, latest.Version); err != nil {
+		_ = recoverFromSession(stateDir, rootDir, session, ui)
 		return err
 	}
-	cleanupAfterCommit(rootDir)
+	cleanupAfterCommit(stateDir)
 	ui.Info("更新完成。")
 	return nil
 }
@@ -154,6 +224,23 @@ func resolveRuntimePaths(opts Options) (string, string, error) {
 	return rootDir, exePath, nil
 }
 
+func resolveStateDir(rootDir, configured string) (string, error) {
+	if configured != "" {
+		return filepath.Abs(configured)
+	}
+	candidates := []string{
+		filepath.Join(rootDir, StateDirName),
+		filepath.Join(filepath.Dir(rootDir), StateDirName),
+		filepath.Join(rootDir, "build", StateDirName),
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	return filepath.Abs(filepath.Join(rootDir, StateDirName))
+}
+
 func validURL(raw string) bool {
 	parsed, err := url.Parse(raw)
 	return err == nil && parsed.Scheme != "" && parsed.Host != ""
@@ -178,22 +265,27 @@ func pathsOf(entries []FileEntry) []string {
 	return paths
 }
 
-func writeSession(rootDir string, session Session, phase string) error {
+func writeSession(stateDir string, session Session, phase string) error {
 	session.Phase = phase
-	return WriteJSONAtomic(statePath(rootDir, "session.json"), session)
+	return WriteJSONAtomic(filepath.Join(stateDir, "session.json"), session)
 }
 
-func stageFiles(ctx context.Context, rootDir, filesBaseURL string, client *http.Client, workers int, plan Plan, ui UI) error {
+func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, client *http.Client, workers int, plan Plan, ui UI) error {
 	entries := append([]FileEntry{}, plan.Add...)
 	entries = append(entries, plan.Modify...)
 	if len(entries) == 0 {
 		return nil
 	}
-	if err := os.RemoveAll(statePath(rootDir, "staging")); err != nil {
+	if err := os.RemoveAll(filepath.Join(stateDir, "staging")); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(statePath(rootDir, "staging"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(stateDir, "staging"), 0o755); err != nil {
 		return err
+	}
+
+	var bytesTotal int64
+	for _, entry := range entries {
+		bytesTotal += entry.Size
 	}
 
 	type job struct {
@@ -203,11 +295,19 @@ func stageFiles(ctx context.Context, rootDir, filesBaseURL string, client *http.
 	errs := make(chan error, len(entries))
 	var wg sync.WaitGroup
 	var progressMu sync.Mutex
-	completed := 0
+	var completed int32
+	var bytesDone int64
+	lastProgress := time.Now()
+	lastSpeedTime := time.Now()
+	lastSpeedBytes := int64(0)
+	speed := float64(0)
 
 	worker := func() {
 		defer wg.Done()
 		for item := range jobs {
+			if ctx.Err() != nil {
+				return
+			}
 			dest, err := stagingPath(rootDir, item.entry.Path)
 			if err != nil {
 				errs <- err
@@ -218,13 +318,45 @@ func stageFiles(ctx context.Context, rootDir, filesBaseURL string, client *http.
 				errs <- err
 				continue
 			}
-			if err := downloadAndVerify(ctx, client, rawURL, dest, item.entry); err != nil {
+			progressCb := func(n int64) {
+				done := atomic.AddInt64(&bytesDone, n)
+				now := time.Now()
+				progressMu.Lock()
+				if now.Sub(lastProgress) >= 200*time.Millisecond {
+					lastProgress = now
+					elapsed := now.Sub(lastSpeedTime).Seconds()
+					if elapsed > 0 {
+						speed = float64(done-lastSpeedBytes) / elapsed
+					}
+					lastSpeedTime = now
+					lastSpeedBytes = done
+					ui.Progress(ProgressEvent{
+						Phase:          "Stage",
+						CurrentFile:    item.entry.Path,
+						CompletedFiles: int(completed),
+						TotalFiles:     len(entries),
+						BytesDone:      done,
+						BytesTotal:     bytesTotal,
+						SpeedBytes:     speed,
+					})
+				}
+				progressMu.Unlock()
+			}
+			if err := downloadAndVerify(ctx, client, rawURL, dest, item.entry, progressCb); err != nil {
 				errs <- fmt.Errorf("下载失败：%s：%w", item.entry.Path, err)
 				continue
 			}
 			progressMu.Lock()
 			completed++
-			ui.Progress(ProgressEvent{Phase: "Stage", CurrentFile: item.entry.Path, CompletedFiles: completed, TotalFiles: len(entries)})
+			ui.Progress(ProgressEvent{
+				Phase:          "Stage",
+				CurrentFile:    item.entry.Path,
+				CompletedFiles: int(completed),
+				TotalFiles:     len(entries),
+				BytesDone:      atomic.LoadInt64(&bytesDone),
+				BytesTotal:     bytesTotal,
+				SpeedBytes:     speed,
+			})
 			progressMu.Unlock()
 		}
 	}
@@ -285,14 +417,14 @@ func occupancyCheck(rootDir string, plan Plan, exePath string, ui UI) error {
 	return nil
 }
 
-func backupFiles(rootDir string, plan Plan, exePath string, session *Session, ui UI) error {
-	if err := os.RemoveAll(statePath(rootDir, "rollback")); err != nil {
+func backupFiles(rootDir, stateDir string, plan Plan, exePath string, session *Session, ui UI) error {
+	if err := os.RemoveAll(filepath.Join(stateDir, "rollback")); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(statePath(rootDir, "rollback"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(stateDir, "rollback"), 0o755); err != nil {
 		return err
 	}
-	if err := writeSession(rootDir, *session, "Backup"); err != nil {
+	if err := writeSession(stateDir, *session, "Backup"); err != nil {
 		return err
 	}
 	entries := append([]FileEntry{}, plan.Modify...)
@@ -320,15 +452,15 @@ func backupFiles(rootDir string, plan Plan, exePath string, session *Session, ui
 			return fmt.Errorf("备份失败：%s：%w", entry.Path, err)
 		}
 		session.BackedUp = append(session.BackedUp, MovedFile{Path: entry.Path, BackupPath: backup})
-		if err := writeSession(rootDir, *session, "Backup"); err != nil {
+		if err := writeSession(stateDir, *session, "Backup"); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func switchFiles(rootDir string, plan Plan, exePath string, session *Session, ui UI) error {
-	if err := writeSession(rootDir, *session, "Switch"); err != nil {
+func switchFiles(rootDir, stateDir string, plan Plan, exePath string, session *Session, ui UI) error {
+	if err := writeSession(stateDir, *session, "Switch"); err != nil {
 		return err
 	}
 	entries := append([]FileEntry{}, plan.Add...)
@@ -355,7 +487,7 @@ func switchFiles(rootDir string, plan Plan, exePath string, session *Session, ui
 				return err
 			}
 			session.PendingSelfUpdate = pending
-			if err := writeSession(rootDir, *session, "Switch"); err != nil {
+			if err := writeSession(stateDir, *session, "Switch"); err != nil {
 				return err
 			}
 			continue
@@ -373,20 +505,20 @@ func switchFiles(rootDir string, plan Plan, exePath string, session *Session, ui
 			return fmt.Errorf("切换失败：%s：%w", entry.Path, err)
 		}
 		session.Switched = append(session.Switched, MovedFile{Path: entry.Path})
-		if err := writeSession(rootDir, *session, "Switch"); err != nil {
+		if err := writeSession(stateDir, *session, "Switch"); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func commit(rootDir string, manifest Manifest, version string) error {
+func commit(stateDir string, manifest Manifest, version string) error {
 	normalized, _, err := NormalizeManifest(manifest)
 	if err != nil {
 		return err
 	}
-	manifestPath := statePath(rootDir, "installed_manifest.json")
-	versionPath := statePath(rootDir, "version.json")
+	manifestPath := filepath.Join(stateDir, "installed_manifest.json")
+	versionPath := filepath.Join(stateDir, "version.json")
 	oldManifest, hadManifest, err := readStateFile(manifestPath)
 	if err != nil {
 		return err
@@ -398,7 +530,7 @@ func commit(rootDir string, manifest Manifest, version string) error {
 		_ = restoreStateFile(manifestPath, oldManifest, hadManifest)
 		return err
 	}
-	_ = os.Remove(statePath(rootDir, "session.json"))
+	_ = os.Remove(filepath.Join(stateDir, "session.json"))
 	return nil
 }
 
@@ -420,20 +552,20 @@ func restoreStateFile(fileName string, data []byte, existed bool) error {
 	return os.WriteFile(fileName, data, 0o644)
 }
 
-func cleanupBeforeRootChange(rootDir string) {
-	_ = os.RemoveAll(statePath(rootDir, "staging"))
-	_ = os.Remove(statePath(rootDir, "session.json"))
+func cleanupBeforeRootChange(stateDir string) {
+	_ = os.RemoveAll(filepath.Join(stateDir, "staging"))
+	_ = os.Remove(filepath.Join(stateDir, "session.json"))
 }
 
-func cleanupAfterCommit(rootDir string) {
-	_ = os.Remove(statePath(rootDir, "session.json"))
-	_ = os.RemoveAll(statePath(rootDir, "staging"))
-	_ = os.RemoveAll(statePath(rootDir, "rollback"))
+func cleanupAfterCommit(stateDir string) {
+	_ = os.Remove(filepath.Join(stateDir, "session.json"))
+	_ = os.RemoveAll(filepath.Join(stateDir, "staging"))
+	_ = os.RemoveAll(filepath.Join(stateDir, "rollback"))
 }
 
-func recoverIfNeeded(rootDir string, ui UI) error {
+func recoverIfNeeded(stateDir, rootDir string, ui UI) error {
 	var session Session
-	ok, err := readOptionalJSON(statePath(rootDir, "session.json"), &session)
+	ok, err := readOptionalJSON(filepath.Join(stateDir, "session.json"), &session)
 	if err != nil {
 		return fmt.Errorf("读取恢复状态失败：%w", err)
 	}
@@ -441,10 +573,10 @@ func recoverIfNeeded(rootDir string, ui UI) error {
 		return nil
 	}
 	ui.Info("检测到上次更新未完成，正在恢复到稳定状态。")
-	return recoverFromSession(rootDir, session, ui)
+	return recoverFromSession(stateDir, rootDir, session, ui)
 }
 
-func recoverFromSession(rootDir string, session Session, ui UI) error {
+func recoverFromSession(stateDir, rootDir string, session Session, ui UI) error {
 	for i := len(session.Switched) - 1; i >= 0; i-- {
 		item := session.Switched[i]
 		target, err := installPath(rootDir, item.Path)
@@ -475,8 +607,8 @@ func recoverFromSession(rootDir string, session Session, ui UI) error {
 		_ = os.Remove(session.PendingSelfUpdate)
 		_ = os.Remove(selfUpdateMarkerPath(rootDir))
 	}
-	_ = os.RemoveAll(statePath(rootDir, "staging"))
-	_ = os.RemoveAll(statePath(rootDir, "rollback"))
-	_ = os.Remove(statePath(rootDir, "session.json"))
+	_ = os.RemoveAll(filepath.Join(stateDir, "staging"))
+	_ = os.RemoveAll(filepath.Join(stateDir, "rollback"))
+	_ = os.Remove(filepath.Join(stateDir, "session.json"))
 	return nil
 }

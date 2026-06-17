@@ -2,10 +2,7 @@
 
 package updatercore
 
-type DialogUI struct {
-	*ConsoleUI
-}
-
+// DefaultUI returns the console UI on non-Windows platforms.
 func DefaultUI(autoConfirm, silent bool) UI {
 	return NewConsoleUI(autoConfirm, silent)
 }

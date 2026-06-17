@@ -31,6 +31,24 @@ func TestGenerateManifestSkipsUpdaterStateAndUsesSHA256Samples(t *testing.T) {
 	}
 }
 
+func TestGenerateManifestSkipsMetadataFiles(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "app.txt"), []byte("abc"))
+	writeTestFile(t, filepath.Join(root, "latest.json"), []byte(`{"version":"1.0.0"}`))
+	writeTestFile(t, filepath.Join(root, "manifest.json"), []byte(`{"version":"1.0.0","files":[]}`))
+
+	manifest, err := GenerateManifest(root, "6.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Files) != 1 {
+		t.Fatalf("files = %d, want 1: %#v", len(manifest.Files), manifest.Files)
+	}
+	if manifest.Files[0].Path != "app.txt" {
+		t.Fatalf("unexpected file path: %q", manifest.Files[0].Path)
+	}
+}
+
 func TestCompareManifestsLargeSetAndUnknownFileProtection(t *testing.T) {
 	root := t.TempDir()
 	installed := Manifest{Version: "1.0.0"}

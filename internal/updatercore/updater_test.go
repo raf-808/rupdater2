@@ -19,6 +19,7 @@ func (testUI) ConfirmProcessTermination([]LockedFile) bool { return true }
 func (testUI) Progress(ProgressEvent)                      {}
 func (testUI) Info(string)                                 {}
 func (testUI) Error(string)                                {}
+func (testUI) ShowVersionInfo(string, string)              {}
 
 func TestRunEndToEndUpdatesManagedFilesAndPreservesUnknownFiles(t *testing.T) {
 	root := t.TempDir()
@@ -123,7 +124,7 @@ func TestRecoverFromSessionRestoresBackupsAndRemovesSwitchedFiles(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	if err := recoverIfNeeded(root, testUI{}); err != nil {
+	if err := recoverIfNeeded(filepath.Join(root, StateDirName), root, testUI{}); err != nil {
 		t.Fatal(err)
 	}
 	assertFileContent(t, filepath.Join(root, "app.txt"), []byte("old"))
@@ -145,7 +146,7 @@ func TestSwitchFilesDefersUpdaterExeReplacement(t *testing.T) {
 
 	session := Session{}
 	plan := Plan{Modify: []FileEntry{entry}}
-	if err := switchFiles(root, plan, exePath, &session, testUI{}); err != nil {
+	if err := switchFiles(root, filepath.Join(root, StateDirName), plan, exePath, &session, testUI{}); err != nil {
 		t.Fatal(err)
 	}
 	assertFileContent(t, exePath, []byte("old updater"))

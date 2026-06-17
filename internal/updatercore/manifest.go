@@ -34,6 +34,9 @@ func GenerateManifest(rootDir, version string) (Manifest, error) {
 			}
 			return nil
 		}
+		if rel == "latest.json" || rel == "manifest.json" {
+			return nil
+		}
 		if entry.Type()&os.ModeType != 0 {
 			return nil
 		}

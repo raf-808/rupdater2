@@ -48,10 +48,10 @@ func fileDownloadURL(baseURL, rel string) (string, error) {
 	return joined, nil
 }
 
-func downloadAndVerify(ctx context.Context, client *http.Client, rawURL, dest string, entry FileEntry) error {
+func downloadAndVerify(ctx context.Context, client *http.Client, rawURL, dest string, entry FileEntry, progress func(int64)) error {
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		if err := downloadFile(ctx, client, rawURL, dest); err != nil {
+		if err := downloadFile(ctx, client, rawURL, dest, progress); err != nil {
 			lastErr = err
 			continue
 		}
@@ -69,7 +69,20 @@ func downloadAndVerify(ctx context.Context, client *http.Client, rawURL, dest st
 	return lastErr
 }
 
-func downloadFile(ctx context.Context, client *http.Client, rawURL, dest string) error {
+type progressReader struct {
+	r  io.Reader
+	cb func(int64)
+}
+
+func (pr *progressReader) Read(p []byte) (int, error) {
+	n, err := pr.r.Read(p)
+	if n > 0 && pr.cb != nil {
+		pr.cb(int64(n))
+	}
+	return n, err
+}
+
+func downloadFile(ctx context.Context, client *http.Client, rawURL, dest string, progress func(int64)) error {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return err
 	}
@@ -93,7 +106,8 @@ func downloadFile(ctx context.Context, client *http.Client, rawURL, dest string)
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(out, resp.Body)
+	body := &progressReader{r: resp.Body, cb: progress}
+	_, copyErr := io.Copy(out, body)
 	closeErr := out.Close()
 	if copyErr != nil {
 		_ = os.Remove(temp)

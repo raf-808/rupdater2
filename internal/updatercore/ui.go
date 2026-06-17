@@ -2,6 +2,7 @@ package updatercore
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,17 @@ type UI interface {
 	Progress(event ProgressEvent)
 	Info(message string)
 	Error(message string)
+	ShowVersionInfo(current, latest string)
+}
+
+// GUIRunner is implemented by UIs that need a message loop on the main thread.
+type GUIRunner interface {
+	RunMessageLoop(work func(context.Context) error, ctx context.Context) error
+}
+
+// CancelSetter is implemented by UIs that can trigger context cancellation.
+type CancelSetter interface {
+	SetCancel(cancel context.CancelFunc)
 }
 
 type ConsoleUI struct {
@@ -75,6 +87,13 @@ func (ui *ConsoleUI) Info(message string) {
 
 func (ui *ConsoleUI) Error(message string) {
 	fmt.Fprintln(ui.Out, message)
+}
+
+func (ui *ConsoleUI) ShowVersionInfo(current, latest string) {
+	if ui.Silent {
+		return
+	}
+	fmt.Fprintf(ui.Out, "当前版本：%s  最新版本：%s\n", emptyAsUnknown(current), latest)
 }
 
 func (ui *ConsoleUI) confirm(message string) bool {

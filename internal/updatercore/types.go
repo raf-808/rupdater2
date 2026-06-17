@@ -17,6 +17,7 @@ var (
 	ErrNoUpdate          = errors.New("no update available")
 	ErrUserCancelled     = errors.New("user cancelled")
 	ErrSelfUpdateHandoff = errors.New("self update handoff started")
+	ErrMissingConfig     = errors.New("missing updater config")
 )
 
 type Config struct {
@@ -53,6 +54,8 @@ type Options struct {
 	Workers     int
 	Client      *http.Client
 	UI          UI
+	StateDir    string
+	KeepStateDir bool
 
 	CompleteSelfUpdate bool
 	SkipSelfUpdate     bool
