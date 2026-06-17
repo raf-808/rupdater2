@@ -7,8 +7,10 @@ INPUT = README.md
 OUTPUT = readme.html
 TEMPLATES = .tmp_header.html .tmp_footer.html
 
-TARGET = rupdater
-GOFILES = main.go
+TARGET = Updater
+GENERATOR = ManifestGenerator
+GOFILES = .
+GENERATOR_PKG = ./cmd/manifestgenerator
 BUILD_DIR = build
 VERSION=$(shell git describe --tags --abbrev=0 | sed 's/v//g')
 
@@ -36,6 +38,7 @@ $(BUILD_DIR):
 # MacOS, 64bit only, no strip working here
 built-darwin:
 	GOOS=darwin GOARCH=amd64 go build $(GOFLAGS) -o $(BUILD_DIR)/$(TARGET)-darwin64  $(GOFILES)
+	GOOS=darwin GOARCH=amd64 go build $(GOFLAGS) -o $(BUILD_DIR)/$(GENERATOR)-darwin64  $(GENERATOR_PKG)
 
 
 # Windows (32+64-bit) build
@@ -44,18 +47,30 @@ build-windows: $(BUILD_DIR)
 	GOOS=windows GOARCH=386 go build ${GOFLAGS} -o $(BUILD_DIR)/$(TARGET)32.exe $(GOFILES)
 	strip $(BUILD_DIR)/$(TARGET)32.exe
 	@echo "[!] Windows 32-bit executable created: $(BUILD_DIR)/$(TARGET)32.exe"
+	GOOS=windows GOARCH=386 go build ${GOFLAGS} -o $(BUILD_DIR)/$(GENERATOR)32.exe $(GENERATOR_PKG)
+	strip $(BUILD_DIR)/$(GENERATOR)32.exe
+	@echo "[!] Windows 32-bit executable created: $(BUILD_DIR)/$(GENERATOR)32.exe"
 	GOOS=windows GOARCH=amd64 go build ${GOFLAGS} -o $(BUILD_DIR)/$(TARGET)64.exe $(GOFILES)
 	strip $(BUILD_DIR)/$(TARGET)64.exe
 	@echo "[!] Windows 64-bit executable created: $(BUILD_DIR)/$(TARGET)64.exe"
+	GOOS=windows GOARCH=amd64 go build ${GOFLAGS} -o $(BUILD_DIR)/$(GENERATOR)64.exe $(GENERATOR_PKG)
+	strip $(BUILD_DIR)/$(GENERATOR)64.exe
+	@echo "[!] Windows 64-bit executable created: $(BUILD_DIR)/$(GENERATOR)64.exe"
 
 # Linux (32+64-bit) build
 build-linux: $(BUILD_DIR)
 	CGO_ENABLED=0 GOOS=linux GOARCH=386 go build ${GOFLAGS} -o $(BUILD_DIR)/$(TARGET)_i686 $(GOFILES)
 	strip $(BUILD_DIR)/$(TARGET)_i686
 	@echo "[!] Linux 32-bit executable created: $(BUILD_DIR)/$(TARGET)_i686"
+	CGO_ENABLED=0 GOOS=linux GOARCH=386 go build ${GOFLAGS} -o $(BUILD_DIR)/$(GENERATOR)_i686 $(GENERATOR_PKG)
+	strip $(BUILD_DIR)/$(GENERATOR)_i686
+	@echo "[!] Linux 32-bit executable created: $(BUILD_DIR)/$(GENERATOR)_i686"
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${GOFLAGS} -o $(BUILD_DIR)/$(TARGET)_amd64 $(GOFILES)
 	strip $(BUILD_DIR)/$(TARGET)_amd64
 	@echo "[!] Linux 32-bit executable created: $(BUILD_DIR)/$(TARGET)_amd64"
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ${GOFLAGS} -o $(BUILD_DIR)/$(GENERATOR)_amd64 $(GENERATOR_PKG)
+	strip $(BUILD_DIR)/$(GENERATOR)_amd64
+	@echo "[!] Linux 64-bit executable created: $(BUILD_DIR)/$(GENERATOR)_amd64"
 
 # Clean up the build directory, cleanup misc. stuff
 clean:
@@ -70,12 +85,15 @@ rebuild: clean all
 
 dist: clean all html
 	file $(BUILD_DIR)/$(TARGET)* > files.txt
+	file $(BUILD_DIR)/$(GENERATOR)* >> files.txt
 	echo "" >> files.txt
 	echo "## GLIBC requirements" >> files.txt
 	ldd -v $(BUILD_DIR)/$(TARGET)* >> files.txt || true
+	ldd -v $(BUILD_DIR)/$(GENERATOR)* >> files.txt || true
 	upx --best --lzma --force-macos $(BUILD_DIR)/$(TARGET)*
+	upx --best --lzma --force-macos $(BUILD_DIR)/$(GENERATOR)*
 	#pandoc README.md -t HTML -o readme.html
-	zip -j "rupdater2_$(current_date_mon).zip"  readme.html $(BUILD_DIR)/$(TARGET)* ChangeLog.txt rupdater_example.txt files.txt
+	zip -j "rupdater2_$(current_date_mon).zip"  readme.html $(BUILD_DIR)/$(TARGET)* $(BUILD_DIR)/$(GENERATOR)* ChangeLog.txt rupdater_example.txt files.txt
 	describe "rupdater2_$(current_date_mon).zip" -desc="ROSE SWE updater release2 - downloads new software from the ROSE SWE download page"
 
 changelog:

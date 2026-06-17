@@ -1,340 +1,58 @@
-/* 	(c) 2020-2026 by ROSE_SWE, Ralph Roth
-https://github.com/roseswe/rupdater2
-*/
-//go:generate goversioninfo -icon=main.ico -manifest=manifest.xml versioninfo.json
 package main
 
 import (
-	"bufio"
-	"crypto/md5"
-	"encoding/hex"
+	"context"
+	"errors"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
-	"strings"
-	"time"
+
+	"updater/internal/updatercore"
 )
 
-// Program version - see what(1) or mywhat
-const version = "@(#)$Id: main.go,v 1.14 2025/12/29 10:53:13 ralph Exp $"
-
-// var BuildDate string // This will be populated during the build
-// downloadFile downloads a file from the given URL and saves it as the given file name
-func downloadFile(url, fileName string) error {
-
-	// Start the timer. New Start
-	startTime := time.Now()
-
-	// Create an HTTP client with a longer timeout.
-	client := &http.Client{
-		Timeout: 15 * time.Minute, // Adjust timeout as needed. RMS = 110MB@500MBit/s
-	}
-
-	// Get the file from the URL using the custom client.
-	resp, err := client.Get(url)
-	if err != nil {
-		return fmt.Errorf("[!] ERROR: Failed to download file: %v", err)
-	}
-	defer resp.Body.Close()
-
-	// Check HTTP status code
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("[!] ERROR: Failed to download file: HTTP status %s", resp.Status)
-	}
-
-	// Create a local file to store the downloaded content
-	out, err := os.Create(fileName)
-	if err != nil {
-		return fmt.Errorf("[!] ERROR: Failed to create file: %v", err)
-	}
-	defer out.Close()
-
-	// Start the timer. Old Start
-	// startTime := time.Now()
-
-	// Create a buffer to read the response body in chunks
-	buf := make([]byte, 1024*1024*2) // 2 MB buffer
-	var totalBytes int64
-
-	for {
-		// Read a chunk
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			// Write the chunk to the file
-			if _, err := out.Write(buf[:n]); err != nil {
-				return fmt.Errorf("[!] ERROR: Failed to write to file: %v", err)
-			}
-			totalBytes += int64(n)
-			// Print a dot for every MB downloaded
-			if totalBytes%(1024*1024*2) == 0 {
-				fmt.Print(".")
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("[!] ERROR: Failed to read response body: %v", err)
-		}
-	}
-	// Calculate and print the download rate.
-	elapsed := time.Since(startTime)
-	mins := int(elapsed.Minutes())
-	secs := elapsed.Seconds() - float64(mins)*60
-	downloadRate := float64(totalBytes) / elapsed.Seconds() / (1024 * 1024) // MB/s
-
-	if (mins == 0 && secs < 3) || (mins > 10) {
-		fmt.Printf(" -> %v (%.2f MB/s) %d bytes", elapsed, downloadRate, totalBytes)  // 123us, 10min23s 1h23m || 65.98912ms (0.01 MB/s) 970 bytes OK!
-	} else {
-		fmt.Printf(" -> %dm%.2fs (%.2f MB/s) %d bytes", mins, secs, downloadRate, totalBytes)
-	}
-
-	return nil
-} // downloadFile
-
-// calculateMD5 calculates the MD5 hash of a file
-func calculateMD5(filePath string) (string, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return "", fmt.Errorf("[!] ERROR: Could not open file: %v", err)
-	}
-	defer file.Close()
-
-	hash := md5.New()
-	if _, err := io.Copy(hash, file); err != nil {
-		return "", fmt.Errorf("[!] ERROR: Could not calculate MD5: %v", err)
-	}
-
-	return hex.EncodeToString(hash.Sum(nil)), nil
-} // calculateMD5
-
-// displayHelp prints the usage instructions for the program
-func displayHelp() {
-	helpText := `
-Usage:
-  rupdater [option[s]]
-
-Options:
-  -d, --delete        Delete the md5sums.md5 file after processing.
-  -k, --keep          Keep files that did not match the MD5 hash.
-  -h, --help, -?      Show help message.
-  -V, --version       Show program version.
-  -u, --url URL       Specify the base URL. If not provided, the
-                      default URL will be used.
-
-Description:
-  This program downloads files from the ROSE SWE download page listed in the
-  remote file: md5sums.md5, verifies their MD5 checksums, and re-downloads
-  (updates) files with mismatched MD5sums. You can choose to delete the
-  md5sums.md5 file after processing, and optionally keep (broken) files even if
-  their MD5 hash does not match.
-
-Exit Codes:
-  0  - Success: The program completed without errors.
-  1  - File Download Error: Unable to download the md5sums.md5 file.
-  2  - File Open Error: Failed to open the md5sums.md5 file.
-  3  - File Read Error: Error reading the md5sums.md5 file.
-  4  - File Deletion Error: Error deleting the md5sums.md5 file after
-       processing.
-  5  - MD5 Mismatch Found: MD5 mismatches were detected and files were
-       deleted (if applicable).
-
-Example:
-  rupdater -d -k
-
-  Downloads files, keeps mismatched files, and deletes the md5sums.md5
-  file when done.
-
-  cfg2html mirroring:  rupdater  --url https://www.cfg2html.com/
-
-  Mirrors instead the cfg2html website
-`
-	fmt.Println(strings.TrimSpace(helpText))
-}
-
-// preprocessArgs maps long flags to short equivalents
-func preprocessArgs() {
-	// Map long flags to short flags
-	argMap := map[string]string{
-		"--help":    "-h",
-		"--version": "-V",
-		"--delete":  "-d",
-		"--keep":    "-k",
-		"--url":     "-u",
-	}
-
-	newArgs := []string{os.Args[0]}
-	for _, arg := range os.Args[1:] {
-		if mapped, exists := argMap[arg]; exists {
-			newArgs = append(newArgs, mapped)
-		} else {
-			newArgs = append(newArgs, arg)
-		}
-	}
-	os.Args = newArgs
-}
-
 func main() {
-	// Greeting line
-	fmt.Println("---=[ rupdater by ROSE SWE, (c) 2024-2026 by Ralph Roth ]=------------------")
-	// ./main.go:129:2: fmt.Println arg list ends with redundant newline
-	fmt.Println("Automatic update program to always get the newest files from ROSE SWE!")
-	fmt.Println("")
-
-	// Preprocess args to handle long flags
-	preprocessArgs()
-
-	// Define command-line flags
-	deleteFile := flag.Bool("d", false, "Delete the md5sums.md5 file after processing.")
-	keepFiles := flag.Bool("k", false, "Keep files that did not match the MD5 hash.")
-	showHelp := flag.Bool("h", false, "Show a detailed help message.")
-	showVersion := flag.Bool("V", false, "Show the program version.")
-	helpAlternative := flag.Bool("?", false, "Show a detailed help message.")
-	// Base URL and downloaded file (hardcoded)
-	baseURL := "http://rose-swe.bplaced.net/dl/"
-	flag.StringVar(&baseURL, "u", baseURL, "Specify an other base URL")
+	rootDir := flag.String("root", "", "安装根目录，默认使用 Updater.exe 所在目录")
+	silent := flag.Bool("silent", false, "静默模式，自动确认更新")
+	debug := flag.Bool("debug", false, "输出调试信息")
+	yes := flag.Bool("yes", false, "自动确认用户提示")
+	workers := flag.Int("workers", 4, "并发下载文件数")
+	showVersion := flag.Bool("version", false, "显示版本")
+	completeSelfUpdate := flag.Bool("complete-self-update", false, "内部参数：完成 Updater.exe 自更新")
+	skipSelfUpdate := flag.Bool("skip-self-update", false, "内部参数：跳过本次自更新交接检查")
+	selfTarget := flag.String("self-target", "", "内部参数：自更新目标路径")
+	selfPending := flag.String("self-pending", "", "内部参数：待安装更新器路径")
 	flag.Parse()
 
-	// Handle version display
 	if *showVersion {
-		fmt.Printf("Version: %s\n", version)
-		//fmt.Printf("Build: %", BuildDate)
-		os.Exit(0)
+		fmt.Println(updatercore.ProgramVersion)
+		return
 	}
 
-	// Handle help display
-	if *showHelp || *helpAlternative {
-		displayHelp()
-		os.Exit(0)
+	opts := updatercore.Options{
+		RootDir:            *rootDir,
+		Silent:             *silent,
+		Debug:              *debug,
+		AutoConfirm:        *yes || *silent,
+		Workers:            *workers,
+		CompleteSelfUpdate: *completeSelfUpdate,
+		SkipSelfUpdate:     *skipSelfUpdate,
+		SelfUpdateTarget:   *selfTarget,
+		SelfUpdatePending:  *selfPending,
 	}
 
-	// Ensure baseURL ends with "/"
-	if !strings.HasSuffix(baseURL, "/") {
-		baseURL += "/"
+	err := updatercore.Run(context.Background(), opts)
+	switch {
+	case err == nil:
+		return
+	case errors.Is(err, updatercore.ErrSelfUpdateHandoff):
+		return
+	case errors.Is(err, updatercore.ErrNoUpdate):
+		return
+	case errors.Is(err, updatercore.ErrUserCancelled):
+		fmt.Fprintln(os.Stderr, "用户已取消更新。")
+		os.Exit(2)
+	default:
+		fmt.Fprintf(os.Stderr, "更新失败：%v\n", err)
+		os.Exit(1)
 	}
-	fmt.Print("[Info] Mirroring now website:", baseURL)
-	downloadedFile := "md5sums.md5"
-	md5URL := baseURL + downloadedFile
-
-	// Step 1: Download the md5sums.md5 file
-	err := downloadFile(md5URL, downloadedFile)
-	if err != nil {
-		fmt.Printf("[!] Error downloading file: %s (%v)\n", md5URL, err)
-		os.Exit(1) // Exit code 1: File download error
-	} else {
-		fmt.Println(" OK!")
-	}
-
-	// Step 2: Open and parse the md5sums.md5 file line by line
-	file, err := os.Open(downloadedFile)
-	if err != nil {
-		fmt.Printf("[!] Error opening file: %v\n", err)
-		os.Exit(2) // Exit code 2: File open error
-	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-	md5MismatchFound := false
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		// Step 3: Parse each line for MD5 hash and file name
-		parts := strings.Fields(line)
-		if len(parts) != 2 {
-			fmt.Printf("[!] Invalid line format: %s\n", line)
-			continue
-		}
-
-		expectedMD5 := parts[0]
-		fileName := parts[1]
-
-		// Step 4: Check if the file exists locally
-		if _, err := os.Stat(fileName); os.IsNotExist(err) {
-			// File does not exist locally, download it from the base URL
-			fileDownloadURL := baseURL + fileName
-			fmt.Printf("[New!] %s downloading...", fileName)
-
-			err = downloadFile(fileDownloadURL, fileName)
-			if err != nil {
-				fmt.Printf("[!] Error downloading file %s: %v\n", fileName, err)
-				continue
-			} else {
-				fmt.Printf(" OK!\n")
-			}
-			//fmt.Printf("[!] File %s downloaded successfully.\n", fileName)  // debugging....
-		}
-
-		// Step 5: Calculate the MD5 hash of the file
-		calculatedMD5, err := calculateMD5(fileName)
-		if err != nil {
-			fmt.Printf("[!] Error calculating MD5 for file %s: %v\n", fileName, err)
-			continue
-		}
-
-		// Step 6: Compare the calculated MD5 with the expected MD5
-		if calculatedMD5 != expectedMD5 {
-			fmt.Printf("[!] WARNING1: MD5 mismatch for file %s. Expected: [%s], Got: [%s]\n", fileName, expectedMD5, calculatedMD5)
-			md5MismatchFound = true
-
-			// Attempt to download the file again
-			fmt.Printf("[!] Attempting to re-download file %s to resolve MD5 mismatch...", fileName)
-			err = downloadFile(baseURL+fileName, fileName)
-			if err != nil {
-				fmt.Printf("\n[!] Error re-downloading file %s: %v\n", fileName, err)
-				continue
-			}
-			fmt.Printf("\n[!] File %s re-downloaded successfully.\n", fileName)
-
-			// Recalculate MD5 after re-downloading
-			calculatedMD5, err = calculateMD5(fileName)
-			if err != nil {
-				fmt.Printf("[!] Error recalculating MD5 for file %s: %v\n", fileName, err)
-				continue
-			}
-
-			// Compare again
-			if calculatedMD5 != expectedMD5 {
-				fmt.Printf("[!] WARNING2: MD5 mismatch still persists for file %s. Expected: [%s], Got: [%s]\n", fileName, expectedMD5, calculatedMD5)
-
-				// Delete the mismatched file unless the -k flag is set
-				if !*keepFiles {
-					err = os.Remove(fileName)
-					if err != nil {
-						fmt.Printf("[!] Error deleting mismatched file %s: %v\n", fileName, err)
-						continue
-					}
-					fmt.Printf("[!] Mismatched file %s deleted.\n", fileName)
-				}
-			} else {
-				fmt.Printf("[!] File %s is now valid after re-downloading (MD5 matches)\n", fileName)
-			}
-		} else {
-			fmt.Printf("[!OK!] %s is valid (MD5 matches)\n", fileName)
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		fmt.Printf("[!] Error reading file: %v\n", err)
-		os.Exit(3) // Exit code 3: File reading error
-	}
-
-	// Step 7: Conditionally delete the downloaded md5sums.md5 file if the -d flag is set
-	if *deleteFile {
-		err = os.Remove(downloadedFile)
-		if err != nil {
-			fmt.Printf("[!] Error deleting file %s: [%v]\n", downloadedFile, err)
-			os.Exit(4) // Exit code 4: File deletion error
-		} else {
-			fmt.Printf("[Info] Downloaded file %s deleted successfully.\n", downloadedFile)
-		}
-	}
-
-	// Step 8: Exit with unique return code if there was an MD5 mismatch
-	if md5MismatchFound && !*keepFiles {
-		os.Exit(5) // Exit code 5: MD5 mismatches found
-	}
-
-	os.Exit(0) // Exit code 0: Success
 }
