@@ -7,12 +7,14 @@ import (
 	"strings"
 )
 
-// 受保护文件：不纳入清单（元数据文件 + 用户配置文件）
-var protectedFiles = map[string]bool{
-	// 元数据文件
+// 元数据文件：不纳入 manifest，所有组件完全忽略
+var metadataFiles = map[string]bool{
 	"latest.json":   true,
 	"manifest.json": true,
-	// 用户配置文件（保护用户自定义数据，不被更新覆盖）
+}
+
+// 用户配置文件：纳入 manifest（供 Sync-Cos.ps1 正常同步），但 Updater.exe 端保护不覆盖
+var userConfigFiles = map[string]bool{
 	"AimanServer/webgemini_server_v2/config/config.json": true,
 	"U-Geminiserver_core/lan.txt":                        true,
 	"U-Geminiserver_core/static/hanzipinyin.json":        true,
@@ -21,9 +23,17 @@ var protectedFiles = map[string]bool{
 	"U-Geminiserver_core/static/voices.json":             true,
 }
 
-// 受保护的文件扩展名：匹配此后缀的文件全部不纳入清单
-var protectedExtensions = map[string]bool{
-	".ini": true, // INI 配置文件
+// 用户配置文件扩展名通配
+var userConfigExts = map[string]bool{
+	".ini": true,
+}
+
+func IsMetadataFile(path string) bool { return metadataFiles[path] }
+func IsUserConfigFile(path string) bool {
+	if userConfigFiles[path] {
+		return true
+	}
+	return userConfigExts[filepath.Ext(path)]
 }
 
 func GenerateManifest(rootDir, version string) (Manifest, error) {
@@ -53,8 +63,8 @@ func GenerateManifest(rootDir, version string) (Manifest, error) {
 			}
 			return nil
 		}
-		if protectedFiles[rel] || protectedExtensions[filepath.Ext(rel)] {
-			return nil
+		if IsMetadataFile(rel) {
+			return nil // 元数据文件不纳入清单
 		}
 		if entry.Type()&os.ModeType != 0 {
 			return nil
@@ -102,6 +112,9 @@ func CompareManifests(rootDir string, installed *Manifest, remote Manifest) (Pla
 	if installed == nil {
 		plan.FirstInstallRecovery = true
 		for _, entry := range remote.Files {
+			if IsMetadataFile(entry.Path) {
+				continue // 元数据文件完全忽略
+			}
 			target, err := installPath(rootDir, entry.Path)
 			if err != nil {
 				return Plan{}, err
@@ -123,6 +136,10 @@ func CompareManifests(rootDir string, installed *Manifest, remote Manifest) (Pla
 		return Plan{}, err
 	}
 	for key, remoteEntry := range remoteMap {
+		// 元数据文件完全忽略
+		if IsMetadataFile(remoteEntry.Path) {
+			continue
+		}
 		installedEntry, exists := installedMap[key]
 		switch {
 		case !exists:
@@ -145,11 +162,19 @@ func CompareManifests(rootDir string, installed *Manifest, remote Manifest) (Pla
 			plan.Add = append(plan.Add, remoteEntry)
 			plan.DownloadSize += remoteEntry.Size
 		case !sameEntry(installedEntry, remoteEntry):
+			// 用户配置文件：远端与本地不同 → 跳过不覆盖（保护用户修改）
+			if IsUserConfigFile(remoteEntry.Path) {
+				continue
+			}
 			plan.Modify = append(plan.Modify, remoteEntry)
 			plan.DownloadSize += remoteEntry.Size
 		}
 	}
 	for key, installedEntry := range installedMap {
+		// 元数据文件和用户配置文件都不删除
+		if IsMetadataFile(installedEntry.Path) || IsUserConfigFile(installedEntry.Path) {
+			continue
+		}
 		if _, exists := remoteMap[key]; !exists {
 			plan.Delete = append(plan.Delete, installedEntry)
 		}
