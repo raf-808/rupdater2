@@ -37,6 +37,7 @@ const (
 	WM_DPICHANGED      = 0x02E0
 	WM_PRINTCLIENT     = 0x0318
 	WM_APP             = 0x8000
+	WM_SETICON         = 0x0080
 )
 
 // Custom messages for worker -> UI communication
@@ -55,6 +56,8 @@ const (
 const (
 	SC_CLOSE           = 0xF060
 	wsOverlappedWindow = 0x00CF0000
+	// 固定大小窗口：保留标题栏、关闭/最小化按钮，禁止拖拽缩放
+	wsFixedWindow = 0x00CEF000 // wsOverlappedWindow 去掉 WS_SIZEBOX(0x40000)，同时去掉 WS_MAXIMIZEBOX
 	wsChild            = 0x40000000
 	wsVisible          = 0x10000000
 	wsVScroll          = 0x00200000
@@ -79,6 +82,10 @@ const (
 	colorBtnFace       = 15
 	idcArrow           = 32512
 	idiApplication     = 32512
+	ICON_SMALL          = 0
+	ICON_BIG            = 1
+	IMAGE_ICON          = 1
+	LR_SHARED           = 0x00008000
 	bsGroupbox         = 0x0007
 	bsDefPushbutton    = 0x0001
 	bsPushbutton       = 0x0000
@@ -210,6 +217,7 @@ var (
 	procGetModuleHandleW      = kernel32.NewProc("GetModuleHandleW")
 	procLoadCursorW           = user32.NewProc("LoadCursorW")
 	procLoadIconW             = user32.NewProc("LoadIconW")
+	procLoadImageW            = user32.NewProc("LoadImageW")
 	procUpdateWindow          = user32.NewProc("UpdateWindow")
 	procGetDpiForWindow       = user32.NewProc("GetDpiForWindow")
 	procSetWindowPos          = user32.NewProc("SetWindowPos")
@@ -372,10 +380,18 @@ func createMainWindow(title string) uintptr {
 		0,
 		uintptr(unsafe.Pointer(classNamePtr)),
 		uintptr(unsafe.Pointer(titlePtr)),
-		uintptr(wsOverlappedWindow),
+		uintptr(wsFixedWindow),
 		120, 120, 620, 720, // 匹配参考设计 ~580px 内容区 + 窗口边框
 		0, 0, hInst, 0,
 	)
+	// 从 exe 资源加载自定义图标并设置到窗口标题栏和任务栏
+	if hwnd != 0 {
+		hIcon, _, _ := procLoadImageW.Call(hInst, 1, IMAGE_ICON, 0, 0, LR_SHARED)
+		if hIcon != 0 {
+			procSendMessageW.Call(hwnd, WM_SETICON, ICON_BIG, hIcon)
+			procSendMessageW.Call(hwnd, WM_SETICON, ICON_SMALL, hIcon)
+		}
+	}
 	return hwnd
 }
 

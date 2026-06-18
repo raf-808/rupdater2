@@ -14,7 +14,7 @@ const (
 )
 
 var (
-	ErrNoUpdate          = errors.New("no update available")
+	ErrNoUpdate          = errors.New("已是最新版本，无需更新")
 	ErrUserCancelled     = errors.New("user cancelled")
 	ErrSelfUpdateHandoff = errors.New("self update handoff started")
 	ErrMissingConfig     = errors.New("missing updater config")

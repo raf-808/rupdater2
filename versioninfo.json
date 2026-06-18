@@ -1,9 +1,1 @@
-{
-  "Version": "2.1.9.0",
-  "ProductName": "rUpdater",
-  "FileDescription": "Simple program that downloads files from a remote server (the ROSE SWE download page)",
-  "CompanyName": "ROSE SWE",
-  "FileVersion": "2.1.9.0",
-  "ProductVersion": "2.1.9.0",
-  "Icon": "main.ico"
-}
+{"Version": "1.0.0.0", "ProductName": "U-GeminiUpdater", "FileDescription": "U-Gemini Server Updater", "CompanyName": "U-Gemini", "FileVersion": "1.0.0.0", "ProductVersion": "1.0.0.0", "Icon": "favicon.ico"}

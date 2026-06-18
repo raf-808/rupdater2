@@ -7,6 +7,25 @@ import (
 	"strings"
 )
 
+// 受保护文件：不纳入清单（元数据文件 + 用户配置文件）
+var protectedFiles = map[string]bool{
+	// 元数据文件
+	"latest.json":   true,
+	"manifest.json": true,
+	// 用户配置文件（保护用户自定义数据，不被更新覆盖）
+	"AimanServer/webgemini_server_v2/config/config.json": true,
+	"U-Geminiserver_core/lan.txt":                        true,
+	"U-Geminiserver_core/static/hanzipinyin.json":        true,
+	"U-Geminiserver_core/static/rare_chars.json":         true,
+	"U-Geminiserver_core/static/units.json":              true,
+	"U-Geminiserver_core/static/voices.json":             true,
+}
+
+// 受保护的文件扩展名：匹配此后缀的文件全部不纳入清单
+var protectedExtensions = map[string]bool{
+	".ini": true, // INI 配置文件
+}
+
 func GenerateManifest(rootDir, version string) (Manifest, error) {
 	if strings.TrimSpace(version) == "" {
 		return Manifest{}, fmt.Errorf("版本号不能为空")
@@ -34,7 +53,7 @@ func GenerateManifest(rootDir, version string) (Manifest, error) {
 			}
 			return nil
 		}
-		if rel == "latest.json" || rel == "manifest.json" {
+		if protectedFiles[rel] || protectedExtensions[filepath.Ext(rel)] {
 			return nil
 		}
 		if entry.Type()&os.ModeType != 0 {

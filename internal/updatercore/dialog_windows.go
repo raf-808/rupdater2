@@ -840,6 +840,11 @@ func (ui *DialogUI) handleDone() {
 		styleButton(ui.hRecheck, true)
 		showCtrl(ui.hRecheck, swShow)
 		enableCtrl(ui.hRecheck, true)
+	case result == ErrNoUpdate:
+		ui.setStatusWithError("当前已是最新版本。", false)
+		styleButton(ui.hCloseBtn, true)
+		showCtrl(ui.hRecheck, swHide)
+		enableCtrl(ui.hRecheck, false)
 	default:
 		ui.setStatusWithError("更新失败。", true) // 红底红字 (匹配 .status-alert)
 		ui.appendError(result.Error())
