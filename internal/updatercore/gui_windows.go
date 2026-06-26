@@ -25,19 +25,23 @@ const (
 
 // Win32 message constants
 const (
-	WM_CREATE          = 0x0001
-	WM_DESTROY         = 0x0002
-	WM_CLOSE           = 0x0010
-	WM_COMMAND         = 0x0111
-	WM_ERASEBKGND      = 0x0014
-	WM_CTLCOLORSTATIC  = 0x0138
-	WM_CTLCOLOREDIT    = 0x0133
-	WM_CTLCOLORBTN     = 0x0135
-	WM_GETMINMAXINFO   = 0x0024
-	WM_DPICHANGED      = 0x02E0
-	WM_PRINTCLIENT     = 0x0318
-	WM_APP             = 0x8000
-	WM_SETICON         = 0x0080
+	WM_CREATE           = 0x0001
+	WM_DESTROY          = 0x0002
+	WM_SIZE             = 0x0005
+	WM_PAINT            = 0x000F
+	WM_CLOSE            = 0x0010
+	WM_COMMAND          = 0x0111
+	WM_ERASEBKGND       = 0x0014
+	WM_WINDOWPOSCHANGED = 0x0047
+	WM_NCPAINT          = 0x0085
+	WM_CTLCOLORSTATIC   = 0x0138
+	WM_CTLCOLOREDIT     = 0x0133
+	WM_CTLCOLORBTN      = 0x0135
+	WM_GETMINMAXINFO    = 0x0024
+	WM_DPICHANGED       = 0x02E0
+	WM_PRINTCLIENT      = 0x0318
+	WM_APP              = 0x8000
+	WM_SETICON          = 0x0080
 )
 
 // Custom messages for worker -> UI communication
@@ -57,38 +61,38 @@ const (
 	SC_CLOSE           = 0xF060
 	wsOverlappedWindow = 0x00CF0000
 	// 固定大小窗口：保留标题栏、关闭/最小化按钮，禁止拖拽缩放
-	wsFixedWindow = 0x00CEF000 // wsOverlappedWindow 去掉 WS_SIZEBOX(0x40000)，同时去掉 WS_MAXIMIZEBOX
-	wsChild            = 0x40000000
-	wsVisible          = 0x10000000
-	wsVScroll          = 0x00200000
-	wsBorder           = 0x00800000
-	ssLeft             = 0x00000000
-	ssCenter           = 0x00000001
-	ssNotify           = 0x00000100
-	esMultiline        = 0x00000004
-	esReadOnly         = 0x0800
-	esAutoVScroll      = 0x0040
-	pbsSmooth          = 0x00000001
-	pbmSetRange32      = 0x0406
-	pbmSetPos          = 0x0402
-	pbmSetBarColor     = 0x0409
-	pbmSetBkColor      = 0x2001
-	bmSetStyle         = 0x00F4
-	swShow             = 5
-	swHide             = 0
-	csHRedraw          = 0x0002
-	csVRedraw          = 0x0001
-	colorWindow        = 5
-	colorBtnFace       = 15
-	idcArrow           = 32512
-	idiApplication     = 32512
-	ICON_SMALL          = 0
-	ICON_BIG            = 1
-	IMAGE_ICON          = 1
-	LR_SHARED           = 0x00008000
-	bsGroupbox         = 0x0007
-	bsDefPushbutton    = 0x0001
-	bsPushbutton       = 0x0000
+	wsFixedWindow   = 0x00CEF000 // wsOverlappedWindow 去掉 WS_SIZEBOX(0x40000)，同时去掉 WS_MAXIMIZEBOX
+	wsChild         = 0x40000000
+	wsVisible       = 0x10000000
+	wsVScroll       = 0x00200000
+	wsBorder        = 0x00800000
+	ssLeft          = 0x00000000
+	ssCenter        = 0x00000001
+	ssNotify        = 0x00000100
+	esMultiline     = 0x00000004
+	esReadOnly      = 0x0800
+	esAutoVScroll   = 0x0040
+	pbsSmooth       = 0x00000001
+	pbmSetRange32   = 0x0406
+	pbmSetPos       = 0x0402
+	pbmSetBarColor  = 0x0409
+	pbmSetBkColor   = 0x2001
+	bmSetStyle      = 0x00F4
+	swShow          = 5
+	swHide          = 0
+	csHRedraw       = 0x0002
+	csVRedraw       = 0x0001
+	colorWindow     = 5
+	colorBtnFace    = 15
+	idcArrow        = 32512
+	idiApplication  = 32512
+	ICON_SMALL      = 0
+	ICON_BIG        = 1
+	IMAGE_ICON      = 1
+	LR_SHARED       = 0x00008000
+	bsGroupbox      = 0x0007
+	bsDefPushbutton = 0x0001
+	bsPushbutton    = 0x0000
 )
 
 // Edit control messages
@@ -132,6 +136,14 @@ const (
 	transparentBkMode      = 1 // TRANSPARENT — 避免静态文字后出现填充块
 	opaqueBkMode           = 2 // OPAQUE — 仅用于编辑框等需要实底的控件
 	defaultCharset         = 1 // DEFAULT_CHARSET
+)
+
+// Dialog layout metrics shared by window creation and control layout.
+const (
+	dialogWindowWidth  = 620
+	dialogWindowHeight = 760
+	dialogMinWidth     = 620
+	dialogMinHeight    = 760
 )
 
 // Win32 types
@@ -231,8 +243,8 @@ var (
 	procSetBkMode             = gdi32.NewProc("SetBkMode")
 	procSetTextColor          = gdi32.NewProc("SetTextColor")
 	procSetBkColor            = gdi32.NewProc("SetBkColor")
-	procInvalidateRect       = user32.NewProc("InvalidateRect")
-	procFillRect             = user32.NewProc("FillRect")
+	procInvalidateRect        = user32.NewProc("InvalidateRect")
+	procFillRect              = user32.NewProc("FillRect")
 )
 
 // Global state for window proc (single-instance application)
@@ -381,7 +393,7 @@ func createMainWindow(title string) uintptr {
 		uintptr(unsafe.Pointer(classNamePtr)),
 		uintptr(unsafe.Pointer(titlePtr)),
 		uintptr(wsFixedWindow),
-		120, 120, 620, 720, // 匹配参考设计 ~580px 内容区 + 窗口边框
+		120, 120, dialogWindowWidth, dialogWindowHeight,
 		0, 0, hInst, 0,
 	)
 	// 从 exe 资源加载自定义图标并设置到窗口标题栏和任务栏

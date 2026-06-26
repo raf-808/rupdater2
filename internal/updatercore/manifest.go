@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 )
 
 // 元数据文件：不纳入 manifest，所有组件完全忽略
@@ -103,7 +105,60 @@ func NormalizeManifest(manifest Manifest) (Manifest, map[string]FileEntry, error
 	return result, entries, nil
 }
 
+type planProgressReporter struct {
+	emit      func(ProgressEvent)
+	total     int
+	completed int
+	lastEmit  time.Time
+	mu        sync.Mutex
+}
+
+func newPlanProgressReporter(total int, emit func(ProgressEvent)) *planProgressReporter {
+	if total <= 0 || emit == nil {
+		return nil
+	}
+	return &planProgressReporter{emit: emit, total: total}
+}
+
+func (r *planProgressReporter) advance(path string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.completed++
+	now := time.Now()
+	if r.lastEmit.IsZero() || r.completed == r.total || now.Sub(r.lastEmit) >= 200*time.Millisecond {
+		r.lastEmit = now
+		r.emit(ProgressEvent{
+			Phase:          "Plan",
+			CurrentFile:    path,
+			CompletedFiles: r.completed,
+			TotalFiles:     r.total,
+		})
+	}
+}
+
 func CompareManifests(rootDir string, installed *Manifest, remote Manifest) (Plan, error) {
+	return CompareManifestsWithProgress(rootDir, installed, remote, 1, nil)
+}
+
+type compareAction uint8
+
+const (
+	compareNoop compareAction = iota
+	compareAdd
+	compareModify
+)
+
+type compareRemoteResult struct {
+	action       compareAction
+	entry        FileEntry
+	downloadSize int64
+	err          error
+}
+
+func CompareManifestsWithProgress(rootDir string, installed *Manifest, remote Manifest, workers int, progress func(ProgressEvent)) (Plan, error) {
 	remote, remoteMap, err := NormalizeManifest(remote)
 	if err != nil {
 		return Plan{}, err
@@ -111,78 +166,139 @@ func CompareManifests(rootDir string, installed *Manifest, remote Manifest) (Pla
 	plan := Plan{LatestVersion: remote.Version, RemoteManifest: remote}
 	if installed == nil {
 		plan.FirstInstallRecovery = true
-		for _, entry := range remote.Files {
-			if IsMetadataFile(entry.Path) {
-				continue // 元数据文件完全忽略
+		reporter := newPlanProgressReporter(len(remote.Files), progress)
+		results := compareRemoteEntries(rootDir, remote.Files, nil, workers, reporter)
+		for _, result := range results {
+			if result.err != nil {
+				return Plan{}, result.err
 			}
-			target, err := installPath(rootDir, entry.Path)
-			if err != nil {
-				return Plan{}, err
-			}
-			ok, err := VerifyFile(target, entry)
-			if err != nil {
-				return Plan{}, fmt.Errorf("校验本地文件失败：%s：%w", entry.Path, err)
-			}
-			if !ok {
-				plan.Add = append(plan.Add, entry)
-				plan.DownloadSize += entry.Size
+			if result.action == compareAdd {
+				plan.Add = append(plan.Add, result.entry)
+				plan.DownloadSize += result.downloadSize
 			}
 		}
 		return plan, nil
 	}
 
-	_, installedMap, err := NormalizeManifest(*installed)
+	installedNormalized, installedMap, err := NormalizeManifest(*installed)
 	if err != nil {
 		return Plan{}, err
 	}
-	for key, remoteEntry := range remoteMap {
-		// 元数据文件完全忽略
-		if IsMetadataFile(remoteEntry.Path) {
-			continue
+	reporter := newPlanProgressReporter(len(remote.Files)+len(installedNormalized.Files), progress)
+	results := compareRemoteEntries(rootDir, remote.Files, installedMap, workers, reporter)
+	for _, result := range results {
+		if result.err != nil {
+			return Plan{}, result.err
 		}
-		installedEntry, exists := installedMap[key]
-		switch {
-		case !exists:
-			target, err := installPath(rootDir, remoteEntry.Path)
-			if err != nil {
-				return Plan{}, err
-			}
-			if _, err := os.Stat(target); err == nil {
-				ok, verifyErr := VerifyFile(target, remoteEntry)
-				if verifyErr != nil {
-					return Plan{}, fmt.Errorf("校验本地未知文件失败：%s：%w", remoteEntry.Path, verifyErr)
-				}
-				if ok {
-					continue
-				}
-				return Plan{}, fmt.Errorf("新增文件目标已存在但不属于已安装清单，已中止以保护未知用户文件：%s", remoteEntry.Path)
-			} else if !os.IsNotExist(err) {
-				return Plan{}, err
-			}
-			plan.Add = append(plan.Add, remoteEntry)
-			plan.DownloadSize += remoteEntry.Size
-		case !sameEntry(installedEntry, remoteEntry):
-			// 用户配置文件：远端与本地不同 → 跳过不覆盖（保护用户修改）
-			if IsUserConfigFile(remoteEntry.Path) {
-				continue
-			}
-			plan.Modify = append(plan.Modify, remoteEntry)
-			plan.DownloadSize += remoteEntry.Size
+		switch result.action {
+		case compareAdd:
+			plan.Add = append(plan.Add, result.entry)
+			plan.DownloadSize += result.downloadSize
+		case compareModify:
+			plan.Modify = append(plan.Modify, result.entry)
+			plan.DownloadSize += result.downloadSize
 		}
 	}
-	for key, installedEntry := range installedMap {
+	for _, installedEntry := range installedNormalized.Files {
+		key := manifestKey(installedEntry.Path)
 		// 元数据文件和用户配置文件都不删除
 		if IsMetadataFile(installedEntry.Path) || IsUserConfigFile(installedEntry.Path) {
+			reporter.advance(installedEntry.Path)
 			continue
 		}
 		if _, exists := remoteMap[key]; !exists {
 			plan.Delete = append(plan.Delete, installedEntry)
 		}
+		reporter.advance(installedEntry.Path)
 	}
 	sortEntries(plan.Add)
 	sortEntries(plan.Modify)
 	sortEntries(plan.Delete)
 	return plan, nil
+}
+
+func compareRemoteEntries(rootDir string, remoteFiles []FileEntry, installedMap map[string]FileEntry, workers int, reporter *planProgressReporter) []compareRemoteResult {
+	if workers <= 0 {
+		workers = 1
+	}
+	type job struct {
+		index int
+		entry FileEntry
+	}
+
+	jobs := make(chan job)
+	results := make([]compareRemoteResult, len(remoteFiles))
+	var wg sync.WaitGroup
+
+	worker := func() {
+		defer wg.Done()
+		for item := range jobs {
+			results[item.index] = compareRemoteEntry(rootDir, item.entry, installedMap)
+			reporter.advance(item.entry.Path)
+		}
+	}
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go worker()
+	}
+	for index, entry := range remoteFiles {
+		jobs <- job{index: index, entry: entry}
+	}
+	close(jobs)
+	wg.Wait()
+	return results
+}
+
+func compareRemoteEntry(rootDir string, remoteEntry FileEntry, installedMap map[string]FileEntry) compareRemoteResult {
+	if IsMetadataFile(remoteEntry.Path) {
+		return compareRemoteResult{}
+	}
+
+	if installedMap == nil {
+		target, err := installPath(rootDir, remoteEntry.Path)
+		if err != nil {
+			return compareRemoteResult{err: err}
+		}
+		ok, err := VerifyFile(target, remoteEntry)
+		if err != nil {
+			return compareRemoteResult{err: fmt.Errorf("校验本地文件失败：%s：%w", remoteEntry.Path, err)}
+		}
+		if !ok {
+			return compareRemoteResult{action: compareAdd, entry: remoteEntry, downloadSize: remoteEntry.Size}
+		}
+		return compareRemoteResult{}
+	}
+
+	key := manifestKey(remoteEntry.Path)
+	installedEntry, exists := installedMap[key]
+	switch {
+	case !exists:
+		target, err := installPath(rootDir, remoteEntry.Path)
+		if err != nil {
+			return compareRemoteResult{err: err}
+		}
+		if _, err := os.Stat(target); err == nil {
+			ok, verifyErr := VerifyFile(target, remoteEntry)
+			if verifyErr != nil {
+				return compareRemoteResult{err: fmt.Errorf("校验本地未知文件失败：%s：%w", remoteEntry.Path, verifyErr)}
+			}
+			if ok {
+				return compareRemoteResult{}
+			}
+			return compareRemoteResult{err: fmt.Errorf("新增文件目标已存在但不属于已安装清单，已中止以保护未知用户文件：%s", remoteEntry.Path)}
+		} else if !os.IsNotExist(err) {
+			return compareRemoteResult{err: err}
+		}
+		return compareRemoteResult{action: compareAdd, entry: remoteEntry, downloadSize: remoteEntry.Size}
+	case !sameEntry(installedEntry, remoteEntry):
+		if IsUserConfigFile(remoteEntry.Path) {
+			return compareRemoteResult{}
+		}
+		return compareRemoteResult{action: compareModify, entry: remoteEntry, downloadSize: remoteEntry.Size}
+	default:
+		return compareRemoteResult{}
+	}
 }
 
 func sameEntry(a, b FileEntry) bool {

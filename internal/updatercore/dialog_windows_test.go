@@ -137,3 +137,64 @@ func TestDialogUIWindowClosePostsQuit(t *testing.T) {
 		t.Fatalf("quitCode = %d", quitCode)
 	}
 }
+
+func TestDialogUIApplyProgressDoesNotRewriteUnchangedStatus(t *testing.T) {
+	ui := NewDialogUI(false)
+	ui.hStatusLbl = 1
+	ui.hFileLbl = 2
+	ui.hSpeedLbl = 3
+	ui.hEtaLbl = 4
+	ui.hCountsLbl = 5
+	ui.hProgress = 6
+
+	var statusWrites int
+	ui.setTextFunc = func(hwnd uintptr, text string) {
+		if hwnd == ui.hStatusLbl {
+			statusWrites++
+		}
+	}
+	ui.sendMessageFunc = func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+		return 0
+	}
+
+	ui.applyProgress(&ProgressEvent{Phase: "Plan", CurrentFile: "a.txt", CompletedFiles: 1, TotalFiles: 10})
+	ui.applyProgress(&ProgressEvent{Phase: "Plan", CurrentFile: "b.txt", CompletedFiles: 2, TotalFiles: 10})
+
+	if statusWrites != 1 {
+		t.Fatalf("statusWrites = %d, want 1", statusWrites)
+	}
+}
+
+func TestDialogUIProgressCoalescesPostedMessages(t *testing.T) {
+	ui := NewDialogUI(false)
+	ui.hwnd = 1
+	ui.hStatusLbl = 1
+	ui.hFileLbl = 2
+	ui.hSpeedLbl = 3
+	ui.hEtaLbl = 4
+	ui.hCountsLbl = 5
+	ui.hProgress = 6
+
+	var posted []uint32
+	ui.postMessageFunc = func(_ uintptr, msg uint32) {
+		posted = append(posted, msg)
+	}
+	ui.setTextFunc = func(hwnd uintptr, text string) {}
+	ui.sendMessageFunc = func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
+		return 0
+	}
+
+	ui.Progress(ProgressEvent{Phase: "Plan", CurrentFile: "a.txt", CompletedFiles: 1, TotalFiles: 10})
+	ui.Progress(ProgressEvent{Phase: "Plan", CurrentFile: "b.txt", CompletedFiles: 2, TotalFiles: 10})
+
+	if len(posted) != 1 {
+		t.Fatalf("posted count = %d, want 1", len(posted))
+	}
+
+	ui.handleMessage(0, wmAppProgress, 0, 0)
+	ui.Progress(ProgressEvent{Phase: "Plan", CurrentFile: "c.txt", CompletedFiles: 3, TotalFiles: 10})
+
+	if len(posted) != 2 {
+		t.Fatalf("posted count after drain = %d, want 2", len(posted))
+	}
+}

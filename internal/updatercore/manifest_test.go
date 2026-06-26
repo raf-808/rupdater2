@@ -92,6 +92,76 @@ func TestCompareManifestsLargeSetAndUnknownFileProtection(t *testing.T) {
 	}
 }
 
+func TestCompareManifestsWithProgressReportsPlanProgress(t *testing.T) {
+	root := t.TempDir()
+	remote := Manifest{
+		Version: "2.0.0",
+		Files: []FileEntry{
+			entryForBytes("app.exe", []byte("new")),
+			entryForBytes("dir/data.bin", []byte("payload")),
+			entryForBytes("config.ini", []byte("k=v")),
+		},
+	}
+
+	var events []ProgressEvent
+	plan, err := CompareManifestsWithProgress(root, nil, remote, 4, func(event ProgressEvent) {
+		events = append(events, event)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Add) != len(remote.Files) {
+		t.Fatalf("add count = %d, want %d", len(plan.Add), len(remote.Files))
+	}
+	if len(events) == 0 {
+		t.Fatal("expected progress events")
+	}
+	last := events[len(events)-1]
+	if last.Phase != "Plan" {
+		t.Fatalf("last phase = %q", last.Phase)
+	}
+	if last.CompletedFiles != len(remote.Files) || last.TotalFiles != len(remote.Files) {
+		t.Fatalf("unexpected progress totals: %#v", last)
+	}
+	if strings.TrimSpace(last.CurrentFile) == "" {
+		t.Fatalf("expected last current file to be set: %#v", last)
+	}
+}
+
+func TestCompareManifestsWithProgressParallelWorkersMatchSingleWorker(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "keep.bin"), []byte("same"))
+	writeTestFile(t, filepath.Join(root, "change.bin"), []byte("old"))
+	installed := Manifest{Version: "1.0.0", Files: []FileEntry{
+		entryForBytes("keep.bin", []byte("same")),
+		entryForBytes("change.bin", []byte("old")),
+	}}
+	remote := Manifest{Version: "2.0.0", Files: []FileEntry{
+		entryForBytes("keep.bin", []byte("same")),
+		entryForBytes("change.bin", []byte("new")),
+		entryForBytes("add.bin", []byte("fresh")),
+	}}
+
+	single, err := CompareManifestsWithProgress(root, &installed, remote, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parallel, err := CompareManifestsWithProgress(root, &installed, remote, 4, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(single.Add) != len(parallel.Add) || len(single.Modify) != len(parallel.Modify) || len(single.Delete) != len(parallel.Delete) {
+		t.Fatalf("single=%#v parallel=%#v", single, parallel)
+	}
+	if single.DownloadSize != parallel.DownloadSize {
+		t.Fatalf("download size single=%d parallel=%d", single.DownloadSize, parallel.DownloadSize)
+	}
+	if parallel.Add[0].Path != "add.bin" || parallel.Modify[0].Path != "change.bin" {
+		t.Fatalf("unexpected parallel plan: %#v", parallel)
+	}
+}
+
 func writeTestFile(t *testing.T, fileName string, data []byte) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(fileName), 0o755); err != nil {

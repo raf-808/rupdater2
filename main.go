@@ -15,7 +15,7 @@ func main() {
 	silent := flag.Bool("silent", false, "静默模式，自动确认更新")
 	debug := flag.Bool("debug", false, "输出调试信息")
 	yes := flag.Bool("yes", false, "自动确认用户提示")
-	workers := flag.Int("workers", 4, "并发下载文件数")
+	workers := flag.Int("workers", 4, "并发工作线程数（Plan 扫描和下载阶段共用）")
 	showVersion := flag.Bool("version", false, "显示版本")
 	completeSelfUpdate := flag.Bool("complete-self-update", false, "内部参数：完成 Updater.exe 自更新")
 	skipSelfUpdate := flag.Bool("skip-self-update", false, "内部参数：跳过本次自更新交接检查")

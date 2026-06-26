@@ -21,6 +21,18 @@ func (testUI) Info(string)                                 {}
 func (testUI) Error(string)                                {}
 func (testUI) ShowVersionInfo(string, string)              {}
 
+type recordingUI struct {
+	progresses []ProgressEvent
+	infos      []string
+}
+
+func (ui *recordingUI) ConfirmPlan(Plan) bool                       { return true }
+func (ui *recordingUI) ConfirmProcessTermination([]LockedFile) bool { return true }
+func (ui *recordingUI) Progress(event ProgressEvent)                { ui.progresses = append(ui.progresses, event) }
+func (ui *recordingUI) Info(message string)                         { ui.infos = append(ui.infos, message) }
+func (ui *recordingUI) Error(string)                                {}
+func (ui *recordingUI) ShowVersionInfo(string, string)              {}
+
 func TestRunEndToEndUpdatesManagedFilesAndPreservesUnknownFiles(t *testing.T) {
 	root := t.TempDir()
 	oldApp := []byte("old app")
@@ -153,6 +165,44 @@ func TestSwitchFilesDefersUpdaterExeReplacement(t *testing.T) {
 	assertFileContent(t, pendingSelfUpdatePath(root), []byte("new updater"))
 	if _, ok, err := readSelfUpdateMarker(root); err != nil || !ok {
 		t.Fatalf("self update marker ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRunNoChangePathReportsCommitProgress(t *testing.T) {
+	root := t.TempDir()
+	current := []byte("same app")
+	writeTestFile(t, filepath.Join(root, "app.txt"), current)
+
+	manifest := Manifest{Version: "2.0.0", Files: []FileEntry{
+		entryForBytes("app.txt", current),
+	}}
+	server := updateServer(t, manifest, map[string][]byte{
+		"app.txt": current,
+	})
+	defer server.Close()
+
+	writeInitialState(t, root, "1.0.0", manifest, server.URL+"/latest.json")
+	ui := &recordingUI{}
+	err := Run(context.Background(), Options{
+		RootDir:     root,
+		AutoConfirm: true,
+		Silent:      true,
+		UI:          ui,
+		ExePath:     filepath.Join(root, "Updater.exe"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foundCommit := false
+	for _, event := range ui.progresses {
+		if event.Phase == "Commit" {
+			foundCommit = true
+			break
+		}
+	}
+	if !foundCommit {
+		t.Fatalf("expected Commit progress event, got %#v", ui.progresses)
 	}
 }
 

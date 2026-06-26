@@ -1,0 +1,154 @@
+C:\U-geminiServer_release\files>updater.exe -debug
+[debug] setStatusWithError enter text="正在检查更新..." isError=false
+[debug] setStatusWithError before SetWindowText
+[debug] setStatusWithError after SetWindowText
+[debug] setStatusWithError invalidate status label
+[debug] setStatusWithError invalidate status panel
+[debug] setStatusWithError exit
+[debug] resetBottomButtons hide hwnd=1643406
+[debug] resetBottomButtons disable hwnd=1643406
+[debug] resetBottomButtons hide hwnd=3935886
+[debug] resetBottomButtons disable hwnd=3935886
+[debug] resetBottomButtons hide hwnd=3018540
+[debug] resetBottomButtons disable hwnd=3018540
+[debug] resetBottomButtons hide hwnd=4855420
+[debug] resetBottomButtons disable hwnd=4855420
+[debug] resetBottomButtons hide hwnd=2166820
+[debug] resetBottomButtons disable hwnd=2166820
+[debug] resetBottomButtons exit
+[debug] handleMessage WM_NCPAINT
+[debug] handleMessage WM_WINDOWPOSCHANGED
+[debug] handleMessage WM_SIZE
+[debug] setStatusWithError enter text="正在检查更新..." isError=false
+[debug] setStatusWithError unchanged, skip
+[debug] resetBottomButtons hide hwnd=1643406
+[debug] resetBottomButtons disable hwnd=1643406
+[debug] resetBottomButtons hide hwnd=3935886
+[debug] resetBottomButtons disable hwnd=3935886
+[debug] resetBottomButtons hide hwnd=3018540
+[debug] resetBottomButtons disable hwnd=3018540
+[debug] resetBottomButtons hide hwnd=4855420
+[debug] resetBottomButtons disable hwnd=4855420
+[debug] resetBottomButtons hide hwnd=2166820
+[debug] resetBottomButtons disable hwnd=2166820
+[debug] resetBottomButtons exit
+[检查] 正在检查远端版本与清单
+[debug] message loop dispatch msg=0xF
+[debug] handleMessage WM_PAINT
+[debug] message loop dispatched msg=0xF
+[debug] message loop dispatch msg=0x8001
+[debug] received wmAppProgress phase=Check current=""
+[debug] applyProgress enter phase=Check current=""
+[debug] applyProgress before set current file label
+[debug] applyProgress after set current file label
+[debug] applyProgress before reset speed/eta text
+[debug] applyProgress after reset speed/eta text
+[debug] setStatusWithError enter text="正在检查远端版本与清单…" isError=false
+[debug] setStatusWithError before SetWindowText
+[debug] setStatusWithError after SetWindowText
+[debug] setStatusWithError invalidate status label
+[debug] setStatusWithError invalidate status panel
+[debug] setStatusWithError exit
+[debug] applyProgress exit phase=Check current=""
+[debug] finished wmAppProgress phase=Check current=""
+[debug] message loop dispatched msg=0x8001
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[计划] AimanServer/_internal/Cython/Compiler/LineTable.cp310-win_amd64.pyd（1/19951）
+[debug] message loop dispatch msg=0x8001
+[debug] received wmAppProgress phase=Plan current="AimanServer/_internal/Cython/Compiler/LineTable.cp310-win_amd64.pyd"
+[debug] applyProgress enter phase=Plan current="AimanServer/_internal/Cython/Compiler/LineTable.cp310-win_amd64.pyd"
+[debug] applyProgress before set current file label
+[debug] applyProgress after set current file label
+[debug] applyProgress before reset speed/eta text
+[debug] applyProgress after reset speed/eta text
+[debug] applyProgress before set plan progress pos=0
+[debug] applyProgress after set plan progress pos
+[debug] applyProgress before set counts label
+[debug] applyProgress after set counts label
+[debug] setStatusWithError enter text="正在扫描本地文件并生成更新计划…" isError=false
+[debug] setStatusWithError before SetWindowText
+[debug] setStatusWithError after SetWindowText
+[debug] setStatusWithError invalidate status label
+[debug] setStatusWithError invalidate status panel
+[debug] setStatusWithError exit
+[debug] applyProgress exit phase=Plan current="AimanServer/_internal/Cython/Compiler/LineTable.cp310-win_amd64.pyd"
+[debug] finished wmAppProgress phase=Plan current="AimanServer/_internal/Cython/Compiler/LineTable.cp310-win_amd64.pyd"
+[debug] message loop dispatched msg=0x8001
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[debug] message loop dispatch msg=0xF
+[debug] message loop dispatched msg=0xF
+[计划] AimanServer/_internal/torch/utils/hipify/version.py（3847/19951）
+[debug] message loop dispatch msg=0x8001
+[debug] received wmAppProgress phase=Plan current="AimanServer/_internal/torch/utils/hipify/version.py"
+[debug] applyProgress enter phase=Plan current="AimanServer/_internal/torch/utils/hipify/version.py"
+[debug] applyProgress before set current file label
+[debug] applyProgress after set current file label
+[debug] applyProgress before reset speed/eta text
+[debug] applyProgress after reset speed/eta text
+[debug] applyProgress before set plan progress pos=19
+[debug] applyProgress after set plan progress pos
+[debug] applyProgress before set counts label
+[debug] applyProgress after set counts label
+[debug] setStatusWithError enter text="正在扫描本地文件并生成更新计划…" isError=false
+[debug] setStatusWithError unchanged, skip
+[debug] applyProgress exit phase=Plan current="AimanServer/_internal/torch/utils/hipify/version.py"
+[debug] finished wmAppProgress phase=Plan current="AimanServer/_internal/torch/utils/hipify/version.py"
+[debug] message loop dispatched msg=0x8001
+[计划] U-Geminiserver_core/_internal/hydra/core/__init__.py（8426/19951）
+[debug] message loop dispatch msg=0x8001
+[debug] received wmAppProgress phase=Plan current="U-Geminiserver_core/_internal/hydra/core/__init__.py"
+[debug] applyProgress enter phase=Plan current="U-Geminiserver_core/_internal/hydra/core/__init__.py"
+[debug] applyProgress before set current file label
+[debug] applyProgress after set current file label
+[debug] applyProgress before reset speed/eta text
+[debug] applyProgress after reset speed/eta text
+[debug] applyProgress before set plan progress pos=42
+[debug] applyProgress after set plan progress pos
+[debug] applyProgress before set counts label
+[debug] applyProgress after set counts label
+[debug] setStatusWithError enter text="正在扫描本地文件并生成更新计划…" isError=false
+[debug] setStatusWithError unchanged, skip
+[debug] applyProgress exit phase=Plan current="U-Geminiserver_core/_internal/hydra/core/__init__.py"
+[debug] finished wmAppProgress phase=Plan current="U-Geminiserver_core/_internal/hydra/core/__init__.py"
+[debug] message loop dispatched msg=0x8001
+[计划] U-Geminiserver_core/_internal/pyarrow/include/arrow/util/cancel.h（13103/19951）
+[计划] U-Geminiserver_core/_internal/transformers/commands/download.py（17545/19951）
+[计划] Updater.exe（19951/19951）
+文件已与最新清单一致，正在提交版本状态。
+[提交] 正在规范化清单
+[debug] commit: normalize start
+[debug] commit: normalize done
+[提交] 正在写入 installed_manifest.json
+[debug] commit: write installed_manifest start
+[debug] commit: write installed_manifest done
+[提交] 正在写入 version.json
+[debug] commit: write version start
+[debug] commit: write version done
+[debug] worker finished, result=<nil>
+[debug] posting wmAppDone

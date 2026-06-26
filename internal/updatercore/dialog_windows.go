@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -16,23 +17,30 @@ import (
 // DialogUI implements UI using a Win32 GUI window.
 type DialogUI struct {
 	AutoConfirm bool
+	Debug       bool
 	cancelFunc  context.CancelFunc
 	hwnd        uintptr
+	buttonY     int32
 	resultChan  chan bool
 	doneChan    chan error
 	waitingFor  waitKind
 
-	mu              sync.Mutex
-	inUpdate        bool
-	updateDone      bool
-	result          error
-	exitResult      error
-	pendingProgress *ProgressEvent
-	pendingInfo     *string
-	pendingError    *string
-	pendingPlan     *Plan
-	pendingLocked   *[]LockedFile
-	pendingVersion  *versionInfo
+	mu                sync.Mutex
+	inUpdate          bool
+	updateDone        bool
+	result            error
+	exitResult        error
+	pendingProgress   *ProgressEvent
+	pendingInfo       *string
+	pendingError      *string
+	pendingPlan       *Plan
+	pendingLocked     *[]LockedFile
+	pendingVersion    *versionInfo
+	progressQueued    bool
+	statusText        string
+	statusError       bool
+	lastUIUpdate      time.Time // UI 级别进度节流：上次实际刷新 Win32 控件的时间戳
+	lastProgressPhase string    // 上次刷新时的阶段，用于检测阶段切换（节流跳过时不更新）
 
 	workFunc        func(context.Context) error
 	ctxFunc         func() context.Context
@@ -86,6 +94,27 @@ const (
 	waitLocked
 )
 
+const (
+	dialogMarginX   = 24
+	dialogRowH      = 28
+	dialogBtnH      = 36
+	dialogLabelW    = 532
+	dialogProgressH = 16
+	dialogGroupPad  = 20
+	dialogErrorH    = 140
+	dialogBtnGap    = 10
+	dialogCloseW    = 92
+	dialogRecheckW  = 108
+	dialogKillW     = 188
+	dialogCancelW   = 88
+	dialogStartW    = 116
+)
+
+type bottomButtonSpec struct {
+	hwnd  uintptr
+	width int32
+}
+
 // NewDialogUI creates a DialogUI without creating the window yet.
 func NewDialogUI(autoConfirm bool) *DialogUI {
 	return &DialogUI{
@@ -113,26 +142,46 @@ func (ui *DialogUI) SetCancel(cancel context.CancelFunc) {
 	ui.mu.Unlock()
 }
 
+func (ui *DialogUI) debugf(format string, args ...any) {
+	debugLog(ui.Debug, format, args...)
+}
+
 // setStatusWithError 设置状态栏文字并标记是否为错误状态（控制红底红字渲染）
 func (ui *DialogUI) setStatusWithError(text string, isError bool) {
+	ui.debugf("setStatusWithError enter text=%q isError=%v", text, isError)
 	ui.mu.Lock()
+	if ui.statusText == text && ui.statusError == isError {
+		ui.mu.Unlock()
+		ui.debugf("setStatusWithError unchanged, skip")
+		return
+	}
+	ui.statusText = text
+	ui.statusError = isError
 	ui.isErrorState = isError
 	ui.mu.Unlock()
+	ui.debugf("setStatusWithError before SetWindowText")
 	ui.setTextFunc(ui.hStatusLbl, text)
+	ui.debugf("setStatusWithError after SetWindowText")
 	if ui.hStatusLbl != 0 {
+		ui.debugf("setStatusWithError invalidate status label")
 		procInvalidateRect.Call(ui.hStatusLbl, 0, 1)
 	}
 	if ui.hStatusPanel != 0 {
+		ui.debugf("setStatusWithError invalidate status panel")
 		procInvalidateRect.Call(ui.hStatusPanel, 0, 1)
 	}
-	if ui.hwnd != 0 {
-		procInvalidateRect.Call(ui.hwnd, 0, 1)
-	}
+	ui.debugf("setStatusWithError exit")
 }
 
 // RunMessageLoop creates the window, runs the work in a goroutine,
 // and runs the message loop on the calling thread.
 func (ui *DialogUI) RunMessageLoop(work func(context.Context) error, ctx context.Context) error {
+	// Windows GUI 消息队列是线程归属的，必须锁定 OS 线程以防止
+	// Go 运行时将 goroutine 迁移到其他线程，导致 GetMessage 收不到
+	// PostMessage 投递的消息（间歇性卡死的根因）。
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	globalDialogMu.Lock()
 	globalDialogUI = ui
 	globalDialogMu.Unlock()
@@ -155,14 +204,24 @@ func (ui *DialogUI) RunMessageLoop(work func(context.Context) error, ctx context
 	ui.rebuildFonts(ui.hwnd)
 
 	showCtrl(ui.hwnd, swShow)
-	procUpdateWindow.Call(ui.hwnd)
-	time.Sleep(150 * time.Millisecond)
 	ui.requestStartWork()
 
 	var m msg
 	for getMessage(&m) > 0 {
+		if ui.Debug {
+			switch m.Message {
+			case wmAppProgress, wmAppPlan, wmAppDone, WM_PAINT, WM_NCPAINT, WM_SIZE, WM_WINDOWPOSCHANGED:
+				ui.debugf("message loop dispatch msg=0x%X", m.Message)
+			}
+		}
 		translateMsg(&m)
 		dispatchMsg(&m)
+		if ui.Debug {
+			switch m.Message {
+			case wmAppProgress, wmAppPlan, wmAppDone, WM_PAINT, WM_NCPAINT, WM_SIZE, WM_WINDOWPOSCHANGED:
+				ui.debugf("message loop dispatched msg=0x%X", m.Message)
+			}
+		}
 	}
 	return ui.exitResult
 }
@@ -207,6 +266,8 @@ func (ui *DialogUI) startWork() {
 	ui.updateDone = false
 	ui.result = nil
 	ui.exitResult = nil
+	ui.lastUIUpdate = time.Time{} // 重置节流计时器，确保首次进度立即刷新
+	ui.lastProgressPhase = ""     // 重置阶段追踪
 	ui.mu.Unlock()
 
 	// 重置 UI 状态（非错误状态）
@@ -221,16 +282,8 @@ func (ui *DialogUI) startWork() {
 	ui.setTextFunc(ui.hErrorEdit, "")
 	ui.sendMessageFunc(ui.hProgress, pbmSetPos, 0, 0)
 
-	// 隐藏结果按钮，禁用再次检查/关闭
-	showCtrl(ui.hRecheck, swHide)
-	enableCtrl(ui.hRecheck, false)
-	showCtrl(ui.hCloseBtn, swHide)
-	enableCtrl(ui.hCloseBtn, false)
-	showCtrl(ui.hKillProc, swHide)
-	enableCtrl(ui.hStart, false)
-	showCtrl(ui.hStart, swHide)
-	enableCtrl(ui.hCancel, false)
-	showCtrl(ui.hCancel, swHide)
+	// 隐藏底部所有按钮，避免遗留上一个状态的控件
+	ui.resetBottomButtons()
 
 	// 创建新的可取消 context
 	ctx := context.Background()
@@ -240,12 +293,14 @@ func (ui *DialogUI) startWork() {
 
 	go func() {
 		result := ui.workFunc(ctx)
+		debugLog(ui.Debug, "worker finished, result=%v", result)
 		ui.mu.Lock()
 		ui.result = result
 		ui.exitResult = result
 		ui.updateDone = true
 		ui.inUpdate = false
 		ui.mu.Unlock()
+		debugLog(ui.Debug, "posting wmAppDone")
 		ui.postMessageFunc(ui.hwnd, wmAppDone)
 	}()
 }
@@ -259,19 +314,26 @@ func (ui *DialogUI) requestStartWork() {
 
 // ConfirmPlan shows the plan and waits for user confirmation.
 func (ui *DialogUI) ConfirmPlan(plan Plan) bool {
+	ui.debugf("ConfirmPlan enter")
 	ui.logVersionInfo(plan.CurrentVersion, plan.LatestVersion)
 	fmt.Fprintf(os.Stdout, "更新计划：新增 %d，修改 %d，删除 %d，下载 %s\n", len(plan.Add), len(plan.Modify), len(plan.Delete), formatBytes(plan.DownloadSize))
+	ui.debugf("ConfirmPlan before lock")
 	ui.mu.Lock()
 	p := plan
 	ui.pendingPlan = &p
 	ui.waitingFor = waitPlan
 	ui.mu.Unlock()
+	ui.debugf("ConfirmPlan after lock hwnd=%d", ui.hwnd)
 	if ui.hwnd != 0 {
+		ui.debugf("ConfirmPlan posting wmAppPlan")
 		ui.postMessageFunc(ui.hwnd, wmAppPlan)
+		ui.debugf("ConfirmPlan posted wmAppPlan")
 	}
 	if ui.AutoConfirm {
+		ui.debugf("ConfirmPlan auto confirm")
 		return true
 	}
+	ui.debugf("ConfirmPlan waiting on resultChan")
 	return <-ui.resultChan
 }
 
@@ -314,10 +376,18 @@ func (ui *DialogUI) logProgress(event ProgressEvent) {
 	case "Check":
 		fmt.Fprintln(os.Stdout, "[检查] 正在检查远端版本与清单")
 	case "Plan":
+		if event.TotalFiles > 0 {
+			fmt.Fprintf(os.Stdout, "[计划] %s（%d/%d）\n", event.CurrentFile, event.CompletedFiles, event.TotalFiles)
+			return
+		}
 		fmt.Fprintln(os.Stdout, "[计划] 正在生成更新计划")
 	case "OccupancyCheck":
 		fmt.Fprintln(os.Stdout, "[占用] 正在检查文件占用状态")
 	case "Commit":
+		if strings.TrimSpace(event.CurrentFile) != "" {
+			fmt.Fprintf(os.Stdout, "[提交] %s\n", event.CurrentFile)
+			return
+		}
 		fmt.Fprintln(os.Stdout, "[提交] 正在提交更新结果")
 	}
 }
@@ -340,6 +410,11 @@ func (ui *DialogUI) Progress(event ProgressEvent) {
 	ui.mu.Lock()
 	ev := event
 	ui.pendingProgress = &ev
+	if ui.progressQueued {
+		ui.mu.Unlock()
+		return
+	}
+	ui.progressQueued = true
 	ui.mu.Unlock()
 	if ui.hwnd != 0 {
 		ui.postMessageFunc(ui.hwnd, wmAppProgress)
@@ -388,6 +463,15 @@ func (ui *DialogUI) handleMessage(hwnd uintptr, msg uint32, wParam uintptr, lPar
 	case WM_CREATE:
 		ui.createControls(hwnd)
 		return 0
+
+	case WM_PAINT:
+		ui.debugf("handleMessage WM_PAINT")
+	case WM_NCPAINT:
+		ui.debugf("handleMessage WM_NCPAINT")
+	case WM_SIZE:
+		ui.debugf("handleMessage WM_SIZE")
+	case WM_WINDOWPOSCHANGED:
+		ui.debugf("handleMessage WM_WINDOWPOSCHANGED")
 
 	case WM_COMMAND:
 		cmdID := int(wParam & 0xFFFF)
@@ -531,16 +615,33 @@ func (ui *DialogUI) handleMessage(hwnd uintptr, msg uint32, wParam uintptr, lPar
 
 	case WM_GETMINMAXINFO:
 		mmi := (*minMaxInfo)(unsafe.Pointer(lParam))
-		mmi.PtMinTrackSize = point{X: 580, Y: 680}
+		mmi.PtMinTrackSize = point{X: dialogMinWidth, Y: dialogMinHeight}
 		return 0
 
 	case wmAppProgress:
 		ui.mu.Lock()
 		ev := ui.pendingProgress
 		ui.pendingProgress = nil
+		ui.progressQueued = false
 		ui.mu.Unlock()
 		if ev != nil {
-			ui.applyProgress(ev)
+			ui.debugf("received wmAppProgress phase=%s current=%q", ev.Phase, ev.CurrentFile)
+			// UI 级别节流：避免高频进度更新导致消息队列 flooding 和 UI 线程饥饿。
+			// 相邻两次 Win32 控件刷新至少间隔 progressThrottleInterval，
+			// 但阶段切换和最后一个文件始终立即刷新。
+			const progressThrottleInterval = 50 * time.Millisecond
+			isPhaseChange := ev.Phase != ui.lastProgressPhase
+			isFinal := ev.TotalFiles > 0 && ev.CompletedFiles >= ev.TotalFiles
+			shouldUpdate := isPhaseChange || isFinal ||
+				time.Since(ui.lastUIUpdate) >= progressThrottleInterval
+			if shouldUpdate {
+				ui.applyProgress(ev)
+				ui.lastUIUpdate = time.Now()
+				ui.lastProgressPhase = ev.Phase
+			} else {
+				ui.debugf("wmAppProgress throttled phase=%s", ev.Phase)
+			}
+			ui.debugf("finished wmAppProgress phase=%s current=%q", ev.Phase, ev.CurrentFile)
 		}
 		return 0
 
@@ -585,6 +686,7 @@ func (ui *DialogUI) handleMessage(hwnd uintptr, msg uint32, wParam uintptr, lPar
 		ui.pendingPlan = nil
 		ui.mu.Unlock()
 		if plan != nil {
+			ui.debugf("received wmAppPlan")
 			ui.showPlan(plan)
 		}
 		return 0
@@ -600,6 +702,7 @@ func (ui *DialogUI) handleMessage(hwnd uintptr, msg uint32, wParam uintptr, lPar
 		return 0
 
 	case wmAppDone:
+		ui.debugf("received wmAppDone")
 		ui.handleDone()
 		return 0
 	}
@@ -610,88 +713,73 @@ func (ui *DialogUI) handleMessage(hwnd uintptr, msg uint32, wParam uintptr, lPar
 // createControls creates all child controls in the window.
 // 布局参数匹配 updater_gui.html 参考设计 (580px内容区, 24px内边距, 20px间距)
 func (ui *DialogUI) createControls(hwnd uintptr) {
-	const (
-		marginX   = 24
-		rowH      = 28 // 匹配 info-row 高度
-		btnH      = 36
-		labelW    = 532 // 580 - 24*2 内边距
-		progressH = 16  // 匹配参考设计 progress-bar-bg height: 16px
-		groupPad  = 20  // 匹配参考设计 fieldset padding: 20px
-		errorH    = 140 // 匹配参考设计 log-textarea height: 140px
-	)
 	y := int32(24)
 
-	ui.hVerGroupBox = createControl(hwnd, "BUTTON", bsGroupbox, idcVerGroupBox, marginX-12, y, labelW+24, 96)
+	ui.hVerGroupBox = createControl(hwnd, "BUTTON", bsGroupbox, idcVerGroupBox, dialogMarginX-12, y, dialogLabelW+24, 96)
 	styleGroupBox(ui.hVerGroupBox)
 	y += 28
-	ui.hVersionLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcVersionLbl, marginX+groupPad, y, labelW-groupPad*2, rowH)
-	y += rowH + 8 // 匹配参考设计 gap: 12px
-	ui.hLatestLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcLatestLbl, marginX+groupPad, y, labelW-groupPad*2, rowH)
-	y += rowH + 20 // info-spacer: 20px
+	ui.hVersionLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcVersionLbl, dialogMarginX+dialogGroupPad, y, dialogLabelW-dialogGroupPad*2, dialogRowH)
+	y += dialogRowH + 8
+	ui.hLatestLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcLatestLbl, dialogMarginX+dialogGroupPad, y, dialogLabelW-dialogGroupPad*2, dialogRowH)
+	y += dialogRowH + 20
 
-	ui.hCountsLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcCountsLbl, marginX+groupPad, y, labelW-groupPad*2, rowH)
-	y += rowH
-	ui.hSizeLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcSizeLbl, marginX+groupPad, y, labelW-groupPad*2, rowH)
-	y += rowH + 20
+	ui.hCountsLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcCountsLbl, dialogMarginX+dialogGroupPad, y, dialogLabelW-dialogGroupPad*2, dialogRowH)
+	y += dialogRowH
+	ui.hSizeLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcSizeLbl, dialogMarginX+dialogGroupPad, y, dialogLabelW-dialogGroupPad*2, dialogRowH)
+	y += dialogRowH + 20
 
 	progBoxY := y - 12
-	ui.hProgGroupBox = createControl(hwnd, "BUTTON", bsGroupbox, idcProgGroupBox, marginX-12, progBoxY, labelW+24, 200)
+	ui.hProgGroupBox = createControl(hwnd, "BUTTON", bsGroupbox, idcProgGroupBox, dialogMarginX-12, progBoxY, dialogLabelW+24, 200)
 	styleGroupBox(ui.hProgGroupBox)
 	y += 22
-	ui.hProgress = createControl(hwnd, "msctls_progress32", pbsSmooth, idcProgress, marginX+groupPad, y, labelW-groupPad*2, progressH)
+	ui.hProgress = createControl(hwnd, "msctls_progress32", pbsSmooth, idcProgress, dialogMarginX+dialogGroupPad, y, dialogLabelW-dialogGroupPad*2, dialogProgressH)
 	ui.sendMessageFunc(ui.hProgress, pbmSetRange32, 0, 100)
 	styleProgressBar(ui.hProgress)
-	y += progressH + 16 // progress-spacer: 18px
+	y += dialogProgressH + 16
 
-	ui.hFileLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcFileLbl, marginX+groupPad, y, labelW-groupPad*2, rowH)
-	y += rowH + 6
-	ui.hSpeedLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcSpeedLbl, marginX+groupPad, y, (labelW-groupPad*2)/2, rowH)
-	ui.hEtaLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcEtaLbl, marginX+groupPad+(labelW-groupPad*2)/2+8, y, (labelW-groupPad*2)/2, rowH)
-	y += rowH + 16
+	ui.hFileLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcFileLbl, dialogMarginX+dialogGroupPad, y, dialogLabelW-dialogGroupPad*2, dialogRowH)
+	y += dialogRowH + 6
+	ui.hSpeedLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcSpeedLbl, dialogMarginX+dialogGroupPad, y, (dialogLabelW-dialogGroupPad*2)/2, dialogRowH)
+	ui.hEtaLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcEtaLbl, dialogMarginX+dialogGroupPad+(dialogLabelW-dialogGroupPad*2)/2+8, y, (dialogLabelW-dialogGroupPad*2)/2, dialogRowH)
+	y += dialogRowH + 16
 
-	ui.hErrorEdit = createControl(hwnd, "EDIT", esMultiline|esReadOnly|esAutoVScroll|wsVScroll|wsBorder, idcErrorEdit, marginX, y, labelW, errorH)
+	ui.hErrorEdit = createControl(hwnd, "EDIT", esMultiline|esReadOnly|esAutoVScroll|wsVScroll|wsBorder, idcErrorEdit, dialogMarginX, y, dialogLabelW, dialogErrorH)
 	applyExplorerTheme(ui.hErrorEdit)
-	y += errorH + 16
+	y += dialogErrorH + 24
 
-	ui.hStatusPanel = createControl(hwnd, "BUTTON", bsGroupbox, 0, marginX-12, y-12, labelW+24, 56)
+	progBoxH := y - progBoxY - 12
+	procSetWindowPos.Call(ui.hProgGroupBox, 0, uintptr(dialogMarginX-12), uintptr(progBoxY), uintptr(dialogLabelW+24), uintptr(progBoxH), 0x0014)
+
+	ui.hStatusPanel = createControl(hwnd, "BUTTON", bsGroupbox, 0, dialogMarginX-12, y-12, dialogLabelW+24, 56)
 	styleGroupBox(ui.hStatusPanel)
 	ui.setTextFunc(ui.hStatusPanel, "")
-	ui.hStatusLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcStatusLbl, marginX+groupPad, y+4, labelW-groupPad*2, rowH)
-	y += rowH + 24
+	ui.hStatusLbl = createControl(hwnd, "STATIC", ssLeft|ssNotify, idcStatusLbl, dialogMarginX+dialogGroupPad, y+4, dialogLabelW-dialogGroupPad*2, dialogRowH)
+	y += dialogRowH + 24
 
-	btnY := y
-	btnRight := int32(marginX + labelW)
-	btnGap := int32(10)
-
-	closeW := int32(92)
-	recheckW := int32(108)
-	killW := int32(188)
-	cancelW := int32(88)
-	startW := int32(116)
-
-	ui.hCloseBtn = createControl(hwnd, "BUTTON", 0, idcCloseBtn, btnRight-closeW, btnY, closeW, btnH)
+	ui.buttonY = y
+	ui.hCloseBtn = createControl(hwnd, "BUTTON", 0, idcCloseBtn, dialogMarginX, ui.buttonY, dialogCloseW, dialogBtnH)
 	ui.setTextFunc(ui.hCloseBtn, "关闭")
 	styleButton(ui.hCloseBtn, false)
 	showCtrl(ui.hCloseBtn, swHide)
 	enableCtrl(ui.hCloseBtn, false)
 
-	ui.hRecheck = createControl(hwnd, "BUTTON", 0, idcRecheck, btnRight-closeW-btnGap-recheckW, btnY, recheckW, btnH)
+	ui.hRecheck = createControl(hwnd, "BUTTON", 0, idcRecheck, dialogMarginX, ui.buttonY, dialogRecheckW, dialogBtnH)
 	ui.setTextFunc(ui.hRecheck, "再次检查")
 	styleButton(ui.hRecheck, false)
 	showCtrl(ui.hRecheck, swHide)
 	enableCtrl(ui.hRecheck, false)
 
-	ui.hKillProc = createControl(hwnd, "BUTTON", 0, idcKillProc, btnRight-closeW-btnGap-recheckW-btnGap-killW, btnY, killW, btnH)
+	ui.hKillProc = createControl(hwnd, "BUTTON", 0, idcKillProc, dialogMarginX, ui.buttonY, dialogKillW, dialogBtnH)
 	ui.setTextFunc(ui.hKillProc, "关闭相关进程并继续")
 	styleButton(ui.hKillProc, false)
 	showCtrl(ui.hKillProc, swHide)
 
-	ui.hCancel = createControl(hwnd, "BUTTON", 0, idcCancel, btnRight-closeW-btnGap-recheckW-btnGap-killW-btnGap-cancelW, btnY, cancelW, btnH)
+	ui.hCancel = createControl(hwnd, "BUTTON", 0, idcCancel, dialogMarginX, ui.buttonY, dialogCancelW, dialogBtnH)
 	ui.setTextFunc(ui.hCancel, "取消")
 	styleButton(ui.hCancel, false)
 	showCtrl(ui.hCancel, swHide)
 
-	ui.hStart = createControl(hwnd, "BUTTON", bsDefPushbutton, idcStart, btnRight-closeW-btnGap-recheckW-btnGap-killW-btnGap-cancelW-btnGap-startW, btnY, startW, btnH)
+	ui.hStart = createControl(hwnd, "BUTTON", bsDefPushbutton, idcStart, dialogMarginX, ui.buttonY, dialogStartW, dialogBtnH)
 	ui.setTextFunc(ui.hStart, "开始更新")
 	styleButton(ui.hStart, true)
 	enableCtrl(ui.hStart, false)
@@ -709,26 +797,80 @@ func (ui *DialogUI) createControls(hwnd uintptr) {
 	ui.setTextFunc(ui.hSpeedLbl, "速度：—")
 	ui.setTextFunc(ui.hEtaLbl, "剩余：—")
 	ui.setStatusWithError("正在检查更新...", false) // 初始状态：非错误
+	ui.resetBottomButtons()
+}
+
+func (ui *DialogUI) layoutBottomButtons(buttons []bottomButtonSpec) {
+	if len(buttons) == 0 {
+		return
+	}
+	totalW := int32(0)
+	for i, button := range buttons {
+		totalW += button.width
+		if i > 0 {
+			totalW += dialogBtnGap
+		}
+	}
+	x := int32(dialogMarginX + dialogLabelW - totalW)
+	if x < dialogMarginX {
+		x = dialogMarginX
+	}
+	for _, button := range buttons {
+		ui.debugf("layoutBottomButtons move hwnd=%d x=%d y=%d w=%d h=%d", button.hwnd, x, ui.buttonY, button.width, dialogBtnH)
+		procSetWindowPos.Call(button.hwnd, 0, uintptr(x), uintptr(ui.buttonY), uintptr(button.width), uintptr(dialogBtnH), 0x0014)
+		x += button.width + dialogBtnGap
+	}
+	ui.debugf("layoutBottomButtons exit count=%d", len(buttons))
+}
+
+func (ui *DialogUI) resetBottomButtons() {
+	buttons := []uintptr{
+		ui.hCloseBtn,
+		ui.hRecheck,
+		ui.hKillProc,
+		ui.hCancel,
+		ui.hStart,
+	}
+	for _, hwnd := range buttons {
+		ui.debugf("resetBottomButtons hide hwnd=%d", hwnd)
+		showCtrl(hwnd, swHide)
+		ui.debugf("resetBottomButtons disable hwnd=%d", hwnd)
+		enableCtrl(hwnd, false)
+	}
+	ui.debugf("resetBottomButtons exit")
+}
+
+func (ui *DialogUI) showBottomButtons(buttons []bottomButtonSpec) {
+	ui.debugf("showBottomButtons enter count=%d", len(buttons))
+	ui.resetBottomButtons()
+	ui.debugf("showBottomButtons after reset")
+	ui.layoutBottomButtons(buttons)
+	ui.debugf("showBottomButtons after layout")
+	for _, button := range buttons {
+		ui.debugf("showBottomButtons show hwnd=%d", button.hwnd)
+		showCtrl(button.hwnd, swShow)
+		ui.debugf("showBottomButtons enable hwnd=%d", button.hwnd)
+		enableCtrl(button.hwnd, true)
+	}
+	ui.debugf("showBottomButtons exit")
 }
 
 // showPlan updates the labels with plan information and enables the start button.
 func (ui *DialogUI) showPlan(plan *Plan) {
+	ui.debugf("showPlan enter")
 	ui.setTextFunc(ui.hVersionLbl, "当前版本："+emptyAsUnknown(plan.CurrentVersion))
 	ui.setTextFunc(ui.hLatestLbl, "最新版本："+emptyAsUnknown(plan.LatestVersion))
 	ui.setTextFunc(ui.hCountsLbl, fmt.Sprintf("新增：%d  修改：%d  删除：%d", len(plan.Add), len(plan.Modify), len(plan.Delete)))
 	ui.setTextFunc(ui.hSizeLbl, "下载大小："+formatBytes(plan.DownloadSize))
 	ui.setStatusWithError("已获取更新计划，请确认是否开始更新。", false)
-	// 隐藏结果按钮，显示开始/取消
-	showCtrl(ui.hRecheck, swHide)
-	enableCtrl(ui.hRecheck, false)
-	showCtrl(ui.hCloseBtn, swHide)
-	enableCtrl(ui.hCloseBtn, false)
-	showCtrl(ui.hStart, swShow)
-	showCtrl(ui.hCancel, swShow)
-	if !ui.AutoConfirm {
-		enableCtrl(ui.hStart, true)
+	ui.showBottomButtons([]bottomButtonSpec{
+		{hwnd: ui.hStart, width: dialogStartW},
+		{hwnd: ui.hCancel, width: dialogCancelW},
+	})
+	if ui.AutoConfirm {
+		enableCtrl(ui.hStart, false)
 	}
-	enableCtrl(ui.hCancel, true)
+	ui.debugf("showPlan exit")
 }
 
 // showLocked updates the labels with locked file information.
@@ -741,13 +883,18 @@ func (ui *DialogUI) showLocked(files []LockedFile) {
 	sb.WriteString("\r\n请点击「关闭相关进程并继续」或「取消」。")
 	ui.appendError(sb.String())
 	ui.setStatusWithError("检测到文件占用，请先释放相关进程。", true)
-	showCtrl(ui.hKillProc, swShow)
-	enableCtrl(ui.hKillProc, true)
+	ui.showBottomButtons([]bottomButtonSpec{
+		{hwnd: ui.hCancel, width: dialogCancelW},
+		{hwnd: ui.hKillProc, width: dialogKillW},
+	})
 }
 
 // applyProgress updates the progress bar and labels.
 func (ui *DialogUI) applyProgress(ev *ProgressEvent) {
+	ui.debugf("applyProgress enter phase=%s current=%q", ev.Phase, ev.CurrentFile)
+	ui.debugf("applyProgress before set current file label")
 	ui.setTextFunc(ui.hFileLbl, "当前文件："+emptyAsUnknown(ev.CurrentFile))
+	ui.debugf("applyProgress after set current file label")
 
 	if ev.Phase == "Stage" {
 		if ev.BytesTotal > 0 {
@@ -755,23 +902,49 @@ func (ui *DialogUI) applyProgress(ev *ProgressEvent) {
 			if ev.BytesDone > 0 {
 				pos = uintptr(ev.BytesDone * 100 / ev.BytesTotal)
 			}
+			ui.debugf("applyProgress before set progress pos bytes pos=%d", pos)
 			ui.sendMessageFunc(ui.hProgress, pbmSetPos, pos, 0)
+			ui.debugf("applyProgress after set progress pos bytes")
 		} else if ev.TotalFiles > 0 {
 			pos := 0
 			if ev.CompletedFiles > 0 {
 				pos = ev.CompletedFiles * 100 / ev.TotalFiles
 			}
+			ui.debugf("applyProgress before set progress pos files pos=%d", pos)
 			ui.sendMessageFunc(ui.hProgress, pbmSetPos, uintptr(pos), 0)
+			ui.debugf("applyProgress after set progress pos files")
 		}
+		ui.debugf("applyProgress before set speed text")
 		ui.setTextFunc(ui.hSpeedLbl, formatSpeed(ev.SpeedBytes))
+		ui.debugf("applyProgress after set speed text")
+		ui.debugf("applyProgress before set eta text")
 		ui.setTextFunc(ui.hEtaLbl, formatETA(ev.BytesDone, ev.BytesTotal, ev.SpeedBytes))
+		ui.debugf("applyProgress after set eta text")
+	} else {
+		ui.debugf("applyProgress before reset speed/eta text")
+		ui.setTextFunc(ui.hSpeedLbl, "速度：—")
+		ui.setTextFunc(ui.hEtaLbl, "剩余：—")
+		ui.debugf("applyProgress after reset speed/eta text")
+	}
+
+	if ev.Phase == "Plan" && ev.TotalFiles > 0 {
+		pos := 0
+		if ev.CompletedFiles > 0 {
+			pos = ev.CompletedFiles * 100 / ev.TotalFiles
+		}
+		ui.debugf("applyProgress before set plan progress pos=%d", pos)
+		ui.sendMessageFunc(ui.hProgress, pbmSetPos, uintptr(pos), 0)
+		ui.debugf("applyProgress after set plan progress pos")
+		ui.debugf("applyProgress before set counts label")
+		ui.setTextFunc(ui.hCountsLbl, fmt.Sprintf("扫描进度：%d / %d", ev.CompletedFiles, ev.TotalFiles))
+		ui.debugf("applyProgress after set counts label")
 	}
 
 	switch ev.Phase {
 	case "Check":
 		ui.setStatusWithError("正在检查远端版本与清单…", false)
 	case "Plan":
-		ui.setStatusWithError("正在生成更新计划…", false)
+		ui.setStatusWithError("正在扫描本地文件并生成更新计划…", false)
 	case "Stage":
 		ui.setStatusWithError("正在下载并校验更新文件…", false)
 	case "OccupancyCheck":
@@ -781,10 +954,15 @@ func (ui *DialogUI) applyProgress(ev *ProgressEvent) {
 	case "Switch":
 		ui.setStatusWithError("正在切换："+ev.CurrentFile, false)
 	case "Commit":
-		ui.setStatusWithError("正在提交更新结果…", false)
+		if strings.TrimSpace(ev.CurrentFile) != "" {
+			ui.setStatusWithError("正在提交更新结果："+ev.CurrentFile, false)
+		} else {
+			ui.setStatusWithError("正在提交更新结果…", false)
+		}
 	case "Recover":
 		ui.setStatusWithError("正在恢复："+ev.CurrentFile, false)
 	}
+	ui.debugf("applyProgress exit phase=%s current=%q", ev.Phase, ev.CurrentFile)
 }
 
 // appendError appends text to the error edit control.
@@ -804,55 +982,50 @@ func (ui *DialogUI) handleDone() {
 	if ui.hwnd == 0 {
 		return
 	}
+	debugLog(ui.Debug, "handleDone entered")
 	ui.mu.Lock()
 	result := ui.result
 	ui.mu.Unlock()
 
-	showCtrl(ui.hKillProc, swHide)
-	enableCtrl(ui.hStart, false)
-	showCtrl(ui.hStart, swHide)
-	enableCtrl(ui.hCancel, false)
-	showCtrl(ui.hCancel, swHide)
+	ui.resetBottomButtons()
 
 	if result == ErrSelfUpdateHandoff {
 		destroyWin(ui.hwnd)
 		return
 	}
 
-	// "关闭"按钮始终显示且可用
-	showCtrl(ui.hCloseBtn, swShow)
-	enableCtrl(ui.hCloseBtn, true)
-
 	switch {
 	case result == nil:
 		ui.setStatusWithError("更新完成。", false)
 		styleButton(ui.hCloseBtn, true)
-		showCtrl(ui.hRecheck, swHide)
-		enableCtrl(ui.hRecheck, false)
+		ui.showBottomButtons([]bottomButtonSpec{{hwnd: ui.hCloseBtn, width: dialogCloseW}})
 	case result == ErrMissingConfig:
 		ui.setStatusWithError("未找到可用配置。", false)
 		styleButton(ui.hCloseBtn, true)
-		showCtrl(ui.hRecheck, swHide)
-		enableCtrl(ui.hRecheck, false)
+		ui.showBottomButtons([]bottomButtonSpec{{hwnd: ui.hCloseBtn, width: dialogCloseW}})
 	case result == ErrUserCancelled:
 		ui.setStatusWithError("用户已取消更新。", false)
 		styleButton(ui.hCloseBtn, false)
 		styleButton(ui.hRecheck, true)
-		showCtrl(ui.hRecheck, swShow)
-		enableCtrl(ui.hRecheck, true)
+		ui.showBottomButtons([]bottomButtonSpec{
+			{hwnd: ui.hRecheck, width: dialogRecheckW},
+			{hwnd: ui.hCloseBtn, width: dialogCloseW},
+		})
 	case result == ErrNoUpdate:
 		ui.setStatusWithError("当前已是最新版本。", false)
 		styleButton(ui.hCloseBtn, true)
-		showCtrl(ui.hRecheck, swHide)
-		enableCtrl(ui.hRecheck, false)
+		ui.showBottomButtons([]bottomButtonSpec{{hwnd: ui.hCloseBtn, width: dialogCloseW}})
 	default:
 		ui.setStatusWithError("更新失败。", true) // 红底红字 (匹配 .status-alert)
 		ui.appendError(result.Error())
 		styleButton(ui.hCloseBtn, false)
 		styleButton(ui.hRecheck, true)
-		showCtrl(ui.hRecheck, swShow)
-		enableCtrl(ui.hRecheck, true)
+		ui.showBottomButtons([]bottomButtonSpec{
+			{hwnd: ui.hRecheck, width: dialogRecheckW},
+			{hwnd: ui.hCloseBtn, width: dialogCloseW},
+		})
 	}
+	debugLog(ui.Debug, "handleDone exited, result=%v", result)
 }
 
 // formatSpeed formats a download speed.

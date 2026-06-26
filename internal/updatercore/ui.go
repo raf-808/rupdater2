@@ -65,12 +65,28 @@ func (ui *ConsoleUI) Progress(event ProgressEvent) {
 		return
 	}
 	switch event.Phase {
+	case "Check":
+		fmt.Fprintln(ui.Out, "正在检查远端版本与清单")
+	case "Plan":
+		if event.TotalFiles > 0 {
+			fmt.Fprintf(ui.Out, "正在扫描本地文件：%s（%d/%d）\n", event.CurrentFile, event.CompletedFiles, event.TotalFiles)
+			return
+		}
+		fmt.Fprintln(ui.Out, "正在生成更新计划")
 	case "Stage":
 		fmt.Fprintf(ui.Out, "正在下载：%s（%d/%d）\n", event.CurrentFile, event.CompletedFiles, event.TotalFiles)
+	case "OccupancyCheck":
+		fmt.Fprintln(ui.Out, "正在检查文件占用状态")
 	case "Backup":
 		fmt.Fprintf(ui.Out, "正在备份：%s\n", event.CurrentFile)
 	case "Switch":
 		fmt.Fprintf(ui.Out, "正在切换：%s\n", event.CurrentFile)
+	case "Commit":
+		if strings.TrimSpace(event.CurrentFile) != "" {
+			fmt.Fprintf(ui.Out, "正在提交更新结果：%s\n", event.CurrentFile)
+			return
+		}
+		fmt.Fprintln(ui.Out, "正在提交更新结果")
 	case "Recover":
 		fmt.Fprintf(ui.Out, "正在恢复：%s\n", event.CurrentFile)
 	default:

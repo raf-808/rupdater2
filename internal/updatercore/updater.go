@@ -13,6 +13,13 @@ import (
 	"time"
 )
 
+func debugLog(enabled bool, format string, args ...any) {
+	if !enabled {
+		return
+	}
+	fmt.Fprintf(os.Stdout, "[debug] "+format+"\n", args...)
+}
+
 func Run(ctx context.Context, opts Options) error {
 	rootDir, exePath, err := resolveRuntimePaths(opts)
 	if err != nil {
@@ -38,6 +45,9 @@ func Run(ctx context.Context, opts Options) error {
 
 	if setter, ok := ui.(CancelSetter); ok {
 		setter.SetCancel(cancel)
+	}
+	if dialogUI, ok := ui.(*DialogUI); ok {
+		dialogUI.Debug = opts.Debug
 	}
 
 	work := func(ctx context.Context) error {
@@ -80,6 +90,7 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 		return ErrUserCancelled
 	}
 
+	ui.Progress(ProgressEvent{Phase: "Check"})
 	latest := LatestInfo{}
 	if err := fetchJSON(ctx, opts.Client, config.LatestURL, &latest); err != nil {
 		return fmt.Errorf("下载 latest.json 失败：%w", err)
@@ -119,7 +130,7 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 		return ErrUserCancelled
 	}
 
-	plan, err := CompareManifests(rootDir, installed, remoteManifest)
+	plan, err := CompareManifestsWithProgress(rootDir, installed, remoteManifest, opts.Workers, ui.Progress)
 	if err != nil {
 		return err
 	}
@@ -132,7 +143,7 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 	}
 	if len(plan.Add) == 0 && len(plan.Modify) == 0 && len(plan.Delete) == 0 {
 		ui.Info("文件已与最新清单一致，正在提交版本状态。")
-		return commit(stateDir, remoteManifest, latest.Version)
+		return commitWithProgress(stateDir, remoteManifest, latest.Version, ui, opts.Debug)
 	}
 	if !ui.ConfirmPlan(plan) {
 		return ErrUserCancelled
@@ -161,6 +172,7 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 		return ErrUserCancelled
 	}
 
+	ui.Progress(ProgressEvent{Phase: "OccupancyCheck"})
 	if err := occupancyCheck(rootDir, plan, exePath, ui); err != nil {
 		cleanupBeforeRootChange(stateDir)
 		return err
@@ -191,7 +203,8 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 		return ErrUserCancelled
 	}
 
-	if err := commit(stateDir, remoteManifest, latest.Version); err != nil {
+	ui.Progress(ProgressEvent{Phase: "Commit"})
+	if err := commitWithProgress(stateDir, remoteManifest, latest.Version, ui, opts.Debug); err != nil {
 		_ = recoverFromSession(stateDir, rootDir, session, ui)
 		return err
 	}
@@ -513,23 +526,42 @@ func switchFiles(rootDir, stateDir string, plan Plan, exePath string, session *S
 }
 
 func commit(stateDir string, manifest Manifest, version string) error {
+	return commitWithProgress(stateDir, manifest, version, nil, false)
+}
+
+func commitWithProgress(stateDir string, manifest Manifest, version string, ui UI, debug bool) error {
+	if ui != nil {
+		ui.Progress(ProgressEvent{Phase: "Commit", CurrentFile: "正在规范化清单"})
+	}
+	debugLog(debug, "commit: normalize start")
 	normalized, _, err := NormalizeManifest(manifest)
 	if err != nil {
 		return err
 	}
+	debugLog(debug, "commit: normalize done")
 	manifestPath := filepath.Join(stateDir, "installed_manifest.json")
 	versionPath := filepath.Join(stateDir, "version.json")
 	oldManifest, hadManifest, err := readStateFile(manifestPath)
 	if err != nil {
 		return err
 	}
+	if ui != nil {
+		ui.Progress(ProgressEvent{Phase: "Commit", CurrentFile: "正在写入 installed_manifest.json"})
+	}
+	debugLog(debug, "commit: write installed_manifest start")
 	if err := WriteJSONAtomic(manifestPath, normalized); err != nil {
 		return err
 	}
+	debugLog(debug, "commit: write installed_manifest done")
+	if ui != nil {
+		ui.Progress(ProgressEvent{Phase: "Commit", CurrentFile: "正在写入 version.json"})
+	}
+	debugLog(debug, "commit: write version start")
 	if err := WriteJSONAtomic(versionPath, VersionState{Version: version}); err != nil {
 		_ = restoreStateFile(manifestPath, oldManifest, hadManifest)
 		return err
 	}
+	debugLog(debug, "commit: write version done")
 	_ = os.Remove(filepath.Join(stateDir, "session.json"))
 	return nil
 }
