@@ -25,9 +25,18 @@ var userConfigFiles = map[string]bool{
 	"U-Geminiserver_core/static/voices.json":             true,
 }
 
-// 用户配置文件扩展名通配
+// 用户配置文件扩展名通配（检测用户修改，修改过则跳过覆盖和删除）
 var userConfigExts = map[string]bool{
-	".ini": true,
+	".ini":    true,
+	".json":   true,
+	".txt":    true,
+	".log":    true,
+	".yaml":   true,
+	".yml":    true,
+	".toml":   true,
+	".cfg":    true,
+	".conf":   true,
+	".config": true,
 }
 
 func IsMetadataFile(path string) bool { return metadataFiles[path] }
@@ -293,6 +302,21 @@ func compareRemoteEntry(rootDir string, remoteEntry FileEntry, installedMap map[
 		return compareRemoteResult{action: compareAdd, entry: remoteEntry, downloadSize: remoteEntry.Size}
 	case !sameEntry(installedEntry, remoteEntry):
 		if IsUserConfigFile(remoteEntry.Path) {
+			// 智能合并：检查用户是否修改过本地文件
+			target, err := installPath(rootDir, remoteEntry.Path)
+			if err != nil {
+				return compareRemoteResult{err: err}
+			}
+			// 与已安装清单中的版本比较，判断用户是否修改过
+			localOk, localErr := VerifyFile(target, installedEntry)
+			if localErr != nil {
+				return compareRemoteResult{err: fmt.Errorf("校验本地用户配置文件失败：%s：%w", remoteEntry.Path, localErr)}
+			}
+			if localOk {
+				// 本地文件与已安装清单一致（用户没改过），可以安全更新
+				return compareRemoteResult{action: compareModify, entry: remoteEntry, downloadSize: remoteEntry.Size}
+			}
+			// 用户修改过，跳过覆盖，保留用户版本
 			return compareRemoteResult{}
 		}
 		return compareRemoteResult{action: compareModify, entry: remoteEntry, downloadSize: remoteEntry.Size}
