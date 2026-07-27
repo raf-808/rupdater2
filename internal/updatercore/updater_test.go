@@ -41,12 +41,12 @@ func TestRunEndToEndUpdatesManagedFilesAndPreservesUnknownFiles(t *testing.T) {
 	newFile := []byte("new managed file")
 
 	writeTestFile(t, filepath.Join(root, "app.txt"), oldApp)
-	writeTestFile(t, filepath.Join(root, "delete.txt"), oldDelete)
+	writeTestFile(t, filepath.Join(root, "delete.bin"), oldDelete)
 	writeTestFile(t, filepath.Join(root, "user.txt"), []byte("user data"))
 
 	installed := Manifest{Version: "1.0.0", Files: []FileEntry{
 		entryForBytes("app.txt", oldApp),
-		entryForBytes("delete.txt", oldDelete),
+		entryForBytes("delete.bin", oldDelete),
 	}}
 	remote := Manifest{Version: "2.0.0", Files: []FileEntry{
 		entryForBytes("app.txt", newApp),
@@ -73,8 +73,8 @@ func TestRunEndToEndUpdatesManagedFilesAndPreservesUnknownFiles(t *testing.T) {
 	assertFileContent(t, filepath.Join(root, "app.txt"), newApp)
 	assertFileContent(t, filepath.Join(root, "new.txt"), newFile)
 	assertFileContent(t, filepath.Join(root, "user.txt"), []byte("user data"))
-	if _, err := os.Stat(filepath.Join(root, "delete.txt")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("delete.txt still exists or stat failed unexpectedly: %v", err)
+	if _, err := os.Stat(filepath.Join(root, "delete.bin")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("delete.bin still exists or stat failed unexpectedly: %v", err)
 	}
 	var version VersionState
 	if err := ReadJSONFile(statePath(root, "version.json"), &version); err != nil {
@@ -203,6 +203,136 @@ func TestRunNoChangePathReportsCommitProgress(t *testing.T) {
 	}
 	if !foundCommit {
 		t.Fatalf("expected Commit progress event, got %#v", ui.progresses)
+	}
+}
+
+func TestRunUsesRemoteCandidatePolicyForCurrentPlanAndInstallsPolicy(t *testing.T) {
+	root := t.TempDir()
+	old := []byte("server old")
+	writeTestFile(t, filepath.Join(root, "user.bin"), []byte("user changed"))
+	policyData := []byte(`{"schema_version":1,"preserve":{"include":{"extensions":[".bin"]}}}`)
+	installed := Manifest{Version: "1", Files: []FileEntry{entryForBytes("user.bin", old)}}
+	remote := Manifest{Version: "2", Files: []FileEntry{
+		entryForBytes("user.bin", []byte("server new")),
+		entryForBytes(PolicyFileName, policyData),
+	}}
+	server := updateServer(t, remote, map[string][]byte{
+		"user.bin":     []byte("server new"),
+		PolicyFileName: policyData,
+	})
+	defer server.Close()
+	writeInitialState(t, root, "1", installed, server.URL+"/latest.json")
+
+	if err := Run(context.Background(), Options{
+		RootDir: root, AutoConfirm: true, Silent: true, UI: testUI{},
+		ExePath: filepath.Join(root, "Updater.exe"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertFileContent(t, filepath.Join(root, "user.bin"), []byte("user changed"))
+	assertFileContent(t, filepath.Join(root, PolicyFileName), policyData)
+	assertNotExists(t, statePath(root, PolicyCandidateName))
+	assertNotExists(t, statePath(root, PolicyCandidateName)+".download")
+}
+
+func TestRunRejectsPolicyCapabilityDowngradeBeforeChangingState(t *testing.T) {
+	root := t.TempDir()
+	old := []byte("old")
+	writeTestFile(t, filepath.Join(root, "app.bin"), old)
+	installed := Manifest{Version: "1", Files: []FileEntry{
+		entryForBytes("app.bin", old),
+		entryForBytes(PolicyFileName, []byte(`{"schema_version":1}`)),
+	}}
+	remote := Manifest{Version: "2", Files: []FileEntry{entryForBytes("app.bin", []byte("new"))}}
+	server := updateServer(t, remote, map[string][]byte{"app.bin": []byte("new")})
+	defer server.Close()
+	writeInitialState(t, root, "1", installed, server.URL+"/latest.json")
+
+	err := Run(context.Background(), Options{
+		RootDir: root, AutoConfirm: true, Silent: true, UI: testUI{},
+		ExePath: filepath.Join(root, "Updater.exe"),
+	})
+	if err == nil || PolicyFailureReason(err) != "policy_missing_manifest_entry" {
+		t.Fatalf("expected policy downgrade error, got %v (%s)", err, PolicyFailureReason(err))
+	}
+	assertFileContent(t, filepath.Join(root, "app.bin"), old)
+	assertNotExists(t, statePath(root, "session.json"))
+}
+
+func TestRunRejectsOversizedPolicyDeclarationWithoutDownloading(t *testing.T) {
+	root := t.TempDir()
+	var policyRequests int
+	remote := Manifest{Version: "2", Files: []FileEntry{{
+		Path: PolicyFileName, Size: MaxPolicySize + 1, HeadHash: "x", TailHash: "x",
+	}}}
+	var serverURL string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/latest.json", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, LatestInfo{Version: "2", ManifestURL: serverURL + "/manifest.json", FilesBaseURL: serverURL + "/files/"})
+	})
+	mux.HandleFunc("/manifest.json", func(w http.ResponseWriter, r *http.Request) { writeJSON(t, w, remote) })
+	mux.HandleFunc("/files/"+PolicyFileName, func(w http.ResponseWriter, r *http.Request) {
+		policyRequests++
+		_, _ = w.Write([]byte(`{"schema_version":1}`))
+	})
+	server := httptest.NewServer(mux)
+	serverURL = server.URL
+	defer server.Close()
+	writeInitialState(t, root, "1", Manifest{Version: "1"}, server.URL+"/latest.json")
+
+	err := Run(context.Background(), Options{
+		RootDir: root, AutoConfirm: true, Silent: true, UI: testUI{},
+		ExePath: filepath.Join(root, "Updater.exe"),
+	})
+	if err == nil || PolicyFailureReason(err) != "policy_too_large" {
+		t.Fatalf("expected policy_too_large, got %v", err)
+	}
+	if policyRequests != 0 {
+		t.Fatalf("policy requests = %d, want 0", policyRequests)
+	}
+	assertNotExists(t, statePath(root, PolicyCandidateName))
+	assertNotExists(t, statePath(root, PolicyCandidateName)+".download")
+}
+
+func TestRunRejectsOversizedOrInvalidCandidateAndCleansTemporaryFiles(t *testing.T) {
+	for name, policyData := range map[string][]byte{
+		"oversized response": append([]byte(`{"schema_version":1}`), make([]byte, MaxPolicySize)...),
+		"hash mismatch":      []byte(`{"schema_version":1}`),
+		"trailing JSON":      []byte(`{"schema_version":1} {}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			entry := entryForBytes(PolicyFileName, policyData)
+			if name == "oversized response" {
+				entry = entryForBytes(PolicyFileName, []byte(`{"schema_version":1}`))
+			} else if name == "hash mismatch" {
+				entry = entryForBytes(PolicyFileName, []byte(`{"schema_version":1,"publish":{}}`))
+			}
+			remote := Manifest{Version: "2", Files: []FileEntry{entry}}
+			server := updateServer(t, remote, map[string][]byte{PolicyFileName: policyData})
+			defer server.Close()
+			writeInitialState(t, root, "1", Manifest{Version: "1"}, server.URL+"/latest.json")
+
+			err := Run(context.Background(), Options{
+				RootDir: root, AutoConfirm: true, Silent: true, UI: testUI{},
+				ExePath: filepath.Join(root, "Updater.exe"),
+			})
+			if err == nil {
+				t.Fatal("expected candidate policy failure")
+			}
+			if name == "hash mismatch" && PolicyFailureReason(err) != "policy_hash_mismatch" {
+				t.Fatalf("failure reason = %s, want policy_hash_mismatch: %v", PolicyFailureReason(err), err)
+			}
+			if name == "oversized response" && PolicyFailureReason(err) != "policy_too_large" {
+				t.Fatalf("failure reason = %s, want policy_too_large: %v", PolicyFailureReason(err), err)
+			}
+			if name == "trailing JSON" && PolicyFailureReason(err) != "policy_invalid_json" {
+				t.Fatalf("failure reason = %s, want policy_invalid_json: %v", PolicyFailureReason(err), err)
+			}
+			assertNotExists(t, statePath(root, PolicyCandidateName))
+			assertNotExists(t, statePath(root, PolicyCandidateName)+".download")
+			assertNotExists(t, statePath(root, "session.json"))
+		})
 	}
 }
 

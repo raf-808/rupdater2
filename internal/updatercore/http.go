@@ -37,8 +37,11 @@ func isStreamError(err error) bool {
 
 // fetchWithFallback 先用默认客户端(HTTP/2)，遇到流错误则用 HTTP/1.1 客户端重试
 func fetchWithFallback(ctx context.Context, doFunc func(client *http.Client) error) error {
-	if err := doFunc(defaultHTTPClient()); err != nil && isStreamError(err) {
-		return doFunc(http11Client)
+	if err := doFunc(defaultHTTPClient()); err != nil {
+		if isStreamError(err) {
+			return doFunc(http11Client)
+		}
+		return err
 	}
 	return nil
 }
@@ -112,12 +115,18 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 
 func downloadFile(ctx context.Context, client *http.Client, rawURL, dest string, progress func(int64)) error {
 	return fetchWithFallback(ctx, func(c *http.Client) error {
-		return doDownload(ctx, c, rawURL, dest, progress)
+		return doDownload(ctx, c, rawURL, dest, 0, progress)
+	})
+}
+
+func downloadFileLimited(ctx context.Context, client *http.Client, rawURL, dest string, limit int64) error {
+	return fetchWithFallback(ctx, func(c *http.Client) error {
+		return doDownload(ctx, c, rawURL, dest, limit, nil)
 	})
 }
 
 // doDownload 执行实际的文件下载（不包含降级逻辑）
-func doDownload(ctx context.Context, client *http.Client, rawURL, dest string, progress func(int64)) error {
+func doDownload(ctx context.Context, client *http.Client, rawURL, dest string, limit int64, progress func(int64)) error {
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return err
 	}
@@ -136,13 +145,20 @@ func doDownload(ctx context.Context, client *http.Client, rawURL, dest string, p
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP 状态异常：%s", resp.Status)
 	}
+	if limit > 0 && resp.ContentLength > limit {
+		return policyError("policy_too_large", "HTTP 响应声明 %d 字节，超过 %d 字节", resp.ContentLength, limit)
+	}
 
 	out, err := os.Create(temp)
 	if err != nil {
 		return err
 	}
-	body := &progressReader{r: resp.Body, cb: progress}
-	_, copyErr := io.Copy(out, body)
+	var source io.Reader = resp.Body
+	if limit > 0 {
+		source = io.LimitReader(resp.Body, limit+1)
+	}
+	body := &progressReader{r: source, cb: progress}
+	written, copyErr := io.Copy(out, body)
 	closeErr := out.Close()
 	if copyErr != nil {
 		_ = os.Remove(temp)
@@ -151,6 +167,10 @@ func doDownload(ctx context.Context, client *http.Client, rawURL, dest string, p
 	if closeErr != nil {
 		_ = os.Remove(temp)
 		return closeErr
+	}
+	if limit > 0 && written > limit {
+		_ = os.Remove(temp)
+		return policyError("policy_too_large", "HTTP 响应超过 %d 字节", limit)
 	}
 	if err := os.Rename(temp, dest); err != nil {
 		_ = os.Remove(temp)

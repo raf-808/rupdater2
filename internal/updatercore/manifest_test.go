@@ -49,6 +49,47 @@ func TestGenerateManifestSkipsMetadataFiles(t *testing.T) {
 	}
 }
 
+func TestGenerateManifestWithPolicyAppliesPublishRulesAndSystemInvariants(t *testing.T) {
+	root := t.TempDir()
+	for path, data := range map[string][]byte{
+		"apps/app.exe":                       []byte("app"),
+		"apps/cache/temp.bin":                []byte("cache"),
+		"other.bin":                          []byte("other"),
+		"latest.json":                        []byte("{}"),
+		"manifest.json":                      []byte("{}"),
+		"updater-policy.json":                []byte(`{"schema_version":1}`),
+		"updater_state/forced-by-policy.exe": []byte("state"),
+	} {
+		writeTestFile(t, filepath.Join(root, filepath.FromSlash(path)), data)
+	}
+	policy, err := ParseFilePolicy([]byte(`{
+		"schema_version":1,
+		"publish":{
+			"include":{"directories":["apps"],"files":["latest.json"],"extensions":[".json"]},
+			"exclude":{"directories":["apps/cache"],"files":["updater-policy.json"]}
+		}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manifest, summary, err := GenerateManifestWithPolicy(root, "7.0.0", policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, entry := range manifest.Files {
+		paths = append(paths, entry.Path)
+	}
+	got := strings.Join(paths, ",")
+	if got != "apps/app.exe,updater-policy.json" {
+		t.Fatalf("manifest paths = %q", got)
+	}
+	if summary.ScannedCount != 4 || summary.IncludedCount != 2 || summary.ExcludedCount != 2 {
+		t.Fatalf("unexpected summary: %#v", summary)
+	}
+}
+
 func TestCompareManifestsLargeSetAndUnknownFileProtection(t *testing.T) {
 	root := t.TempDir()
 	installed := Manifest{Version: "1.0.0"}
@@ -159,6 +200,70 @@ func TestCompareManifestsWithProgressParallelWorkersMatchSingleWorker(t *testing
 	}
 	if parallel.Add[0].Path != "add.bin" || parallel.Modify[0].Path != "change.bin" {
 		t.Fatalf("unexpected parallel plan: %#v", parallel)
+	}
+}
+
+func TestCompareManifestsWithPolicyProtectsOnlyUserModifiedFiles(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "user.ini"), []byte("user changed"))
+	writeTestFile(t, filepath.Join(root, "clean.ini"), []byte("old clean"))
+	writeTestFile(t, filepath.Join(root, "system.ini"), []byte("old system"))
+	writeTestFile(t, filepath.Join(root, "removed.ini"), []byte("keep removed"))
+
+	installed := Manifest{Version: "1", Files: []FileEntry{
+		entryForBytes("user.ini", []byte("old user")),
+		entryForBytes("clean.ini", []byte("old clean")),
+		entryForBytes("system.ini", []byte("old system")),
+		entryForBytes("removed.ini", []byte("old removed")),
+	}}
+	remote := Manifest{Version: "2", Files: []FileEntry{
+		entryForBytes("user.ini", []byte("new user")),
+		entryForBytes("clean.ini", []byte("new clean")),
+		entryForBytes("system.ini", []byte("new system")),
+	}}
+	policy, err := ParseFilePolicy([]byte(`{
+		"schema_version":1,
+		"preserve":{
+			"include":{"extensions":[".ini"]},
+			"exclude":{"files":["system.ini"]}
+		}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	single, err := CompareManifestsWithPolicy(root, &installed, remote, policy, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parallel, err := CompareManifestsWithPolicy(root, &installed, remote, policy, 4, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, plan := range map[string]Plan{"single": single, "parallel": parallel} {
+		if len(plan.Modify) != 2 || plan.Modify[0].Path != "clean.ini" || plan.Modify[1].Path != "system.ini" {
+			t.Fatalf("%s unexpected modify: %#v", name, plan.Modify)
+		}
+		if len(plan.Delete) != 0 {
+			t.Fatalf("%s protected delete unexpectedly planned: %#v", name, plan.Delete)
+		}
+		if plan.PreservedModify != 1 || plan.PreservedDelete != 1 {
+			t.Fatalf("%s preserved counts = %d/%d", name, plan.PreservedModify, plan.PreservedDelete)
+		}
+	}
+}
+
+func TestCompareManifestsWithPolicyStillRejectsUnknownTarget(t *testing.T) {
+	root := t.TempDir()
+	writeTestFile(t, filepath.Join(root, "unknown.ini"), []byte("local"))
+	policy, err := ParseFilePolicy([]byte(`{"schema_version":1,"preserve":{"include":{"extensions":[".ini"]}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := Manifest{Version: "2", Files: []FileEntry{entryForBytes("unknown.ini", []byte("remote"))}}
+	if _, err := CompareManifestsWithPolicy(root, &Manifest{Version: "1"}, remote, policy, 2, nil); err == nil ||
+		!strings.Contains(err.Error(), "保护未知用户文件") {
+		t.Fatalf("expected unknown target conflict, got %v", err)
 	}
 }
 

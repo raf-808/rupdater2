@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,6 +52,7 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	work := func(ctx context.Context) error {
+		defer cleanupPolicyCandidate(stateDir)
 		if opts.CompleteSelfUpdate {
 			return completeSelfUpdate(rootDir, opts.SelfUpdateTarget, opts.SelfUpdatePending, ui)
 		}
@@ -116,6 +118,10 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 	if remoteManifest.Version != latest.Version {
 		return fmt.Errorf("latest.json 版本与 manifest.json 版本不一致：%s != %s", latest.Version, remoteManifest.Version)
 	}
+	remoteManifest, _, err = NormalizeManifest(remoteManifest)
+	if err != nil {
+		return fmt.Errorf("远端清单非法：%w", err)
+	}
 
 	var installed *Manifest
 	installedManifest := Manifest{}
@@ -130,10 +136,18 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 		return ErrUserCancelled
 	}
 
-	plan, err := CompareManifestsWithProgress(rootDir, installed, remoteManifest, opts.Workers, ui.Progress)
+	policy, err := loadPolicyForPlan(ctx, stateDir, latest.FilesBaseURL, opts.Client, installed, remoteManifest, opts.Debug)
 	if err != nil {
 		return err
 	}
+
+	plan, err := CompareManifestsWithPolicy(rootDir, installed, remoteManifest, policy, opts.Workers, ui.Progress)
+	if err != nil {
+		return err
+	}
+	debugLog(opts.Debug,
+		"policy_plan_summary add_count=%d modify_count=%d delete_count=%d preserved_modify=%d preserved_delete=%d",
+		len(plan.Add), len(plan.Modify), len(plan.Delete), plan.PreservedModify, plan.PreservedDelete)
 	plan.CurrentVersion = version.Version
 	plan.LatestVersion = latest.Version
 	for _, entry := range plan.Delete {
@@ -211,6 +225,83 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 	cleanupAfterCommit(stateDir)
 	ui.Info("更新完成。")
 	return nil
+}
+
+func loadPolicyForPlan(ctx context.Context, stateDir, filesBaseURL string, client *http.Client, installed *Manifest, remote Manifest, debug bool) (FilePolicy, error) {
+	remoteEntry, remoteHasPolicy := manifestEntry(remote, PolicyFileName)
+	installedHasPolicy := false
+	if installed != nil {
+		_, installedHasPolicy = manifestEntry(*installed, PolicyFileName)
+	}
+	if !remoteHasPolicy {
+		if installedHasPolicy {
+			err := policyError("policy_missing_manifest_entry", "已安装清单包含 %s，但远端清单缺失该条目", PolicyFileName)
+			debugPolicyLoadFailure(debug, "remote", err)
+			return FilePolicy{}, err
+		}
+		policy := DefaultFilePolicy()
+		debugLog(debug, "policy_load_success source=fallback schema_version=%d policy_file=%s", policy.SchemaVersion, PolicyFileName)
+		return policy, nil
+	}
+	if remoteEntry.Size > MaxPolicySize {
+		err := policyError("policy_too_large", "清单声明 %s 为 %d 字节，超过 %d 字节", PolicyFileName, remoteEntry.Size, MaxPolicySize)
+		debugPolicyLoadFailure(debug, "remote", err)
+		return FilePolicy{}, err
+	}
+
+	candidate := filepath.Join(stateDir, PolicyCandidateName)
+	rawURL, err := fileDownloadURL(filesBaseURL, PolicyFileName)
+	if err != nil {
+		wrapped := policyError("policy_download_failed", "构造策略下载地址失败：%v", err)
+		debugPolicyLoadFailure(debug, "remote", wrapped)
+		return FilePolicy{}, wrapped
+	}
+	if err := downloadFileLimited(ctx, client, rawURL, candidate, MaxPolicySize); err != nil {
+		if PolicyFailureReason(err) == "policy_too_large" {
+			debugPolicyLoadFailure(debug, "remote", err)
+			return FilePolicy{}, err
+		}
+		wrapped := policyError("policy_download_failed", "下载候选策略失败：%v", err)
+		debugPolicyLoadFailure(debug, "remote", wrapped)
+		return FilePolicy{}, wrapped
+	}
+	ok, err := VerifyFile(candidate, remoteEntry)
+	if err != nil || !ok {
+		if err == nil {
+			err = fmt.Errorf("大小或 SHA-256 哈希不匹配")
+		}
+		wrapped := policyError("policy_hash_mismatch", "候选策略校验失败：%v", err)
+		debugPolicyLoadFailure(debug, "remote", wrapped)
+		return FilePolicy{}, wrapped
+	}
+	policy, err := LoadFilePolicy(candidate)
+	if err != nil {
+		debugPolicyLoadFailure(debug, "remote", err)
+		return FilePolicy{}, err
+	}
+	debugLog(debug, "policy_load_success source=remote schema_version=%d policy_file=%s", policy.SchemaVersion, PolicyFileName)
+	return policy, nil
+}
+
+func manifestEntry(manifest Manifest, wanted string) (FileEntry, bool) {
+	for _, entry := range manifest.Files {
+		normalized, err := NormalizeManifestPath(entry.Path)
+		if err == nil && strings.EqualFold(normalized, wanted) {
+			entry.Path = normalized
+			return entry, true
+		}
+	}
+	return FileEntry{}, false
+}
+
+func debugPolicyLoadFailure(debug bool, source string, err error) {
+	debugLog(debug, "policy_load_failed source=%s policy_file=%s failure_reason=%s", source, PolicyFileName, PolicyFailureReason(err))
+}
+
+func cleanupPolicyCandidate(stateDir string) {
+	candidate := filepath.Join(stateDir, PolicyCandidateName)
+	_ = os.Remove(candidate)
+	_ = os.Remove(candidate + ".download")
 }
 
 func resolveRuntimePaths(opts Options) (string, string, error) {

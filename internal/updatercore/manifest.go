@@ -9,53 +9,36 @@ import (
 	"time"
 )
 
-// 元数据文件：不纳入 manifest，所有组件完全忽略
-var metadataFiles = map[string]bool{
-	"latest.json":   true,
-	"manifest.json": true,
+var compatibilityFilePolicy = DefaultFilePolicy()
+
+func IsMetadataFile(path string) bool {
+	normalized, err := NormalizeManifestPath(path)
+	return err == nil && isMetadataPath(normalized)
 }
 
-// 用户配置文件：纳入 manifest（供 Sync-Cos.ps1 正常同步），但 Updater.exe 端保护不覆盖
-var userConfigFiles = map[string]bool{
-	"AimanServer/webgemini_server_v2/config/config.json": true,
-	"U-Geminiserver_core/lan.txt":                        true,
-	"U-Geminiserver_core/static/hanzipinyin.json":        true,
-	"U-Geminiserver_core/static/rare_chars.json":         true,
-	"U-Geminiserver_core/static/units.json":              true,
-	"U-Geminiserver_core/static/voices.json":             true,
-}
+func IsUserConfigFile(path string) bool { return compatibilityFilePolicy.ShouldPreserve(path) }
 
-// 用户配置文件扩展名通配（检测用户修改，修改过则跳过覆盖和删除）
-var userConfigExts = map[string]bool{
-	".ini":    true,
-	".json":   true,
-	".txt":    true,
-	".log":    true,
-	".yaml":   true,
-	".yml":    true,
-	".toml":   true,
-	".cfg":    true,
-	".conf":   true,
-	".config": true,
-}
-
-func IsMetadataFile(path string) bool { return metadataFiles[path] }
-func IsUserConfigFile(path string) bool {
-	if userConfigFiles[path] {
-		return true
-	}
-	return userConfigExts[filepath.Ext(path)]
+type ManifestPolicySummary struct {
+	ScannedCount  int
+	IncludedCount int
+	ExcludedCount int
 }
 
 func GenerateManifest(rootDir, version string) (Manifest, error) {
+	manifest, _, err := GenerateManifestWithPolicy(rootDir, version, DefaultFilePolicy())
+	return manifest, err
+}
+
+func GenerateManifestWithPolicy(rootDir, version string, policy FilePolicy) (Manifest, ManifestPolicySummary, error) {
 	if strings.TrimSpace(version) == "" {
-		return Manifest{}, fmt.Errorf("版本号不能为空")
+		return Manifest{}, ManifestPolicySummary{}, fmt.Errorf("版本号不能为空")
 	}
 	absRoot, err := filepath.Abs(rootDir)
 	if err != nil {
-		return Manifest{}, err
+		return Manifest{}, ManifestPolicySummary{}, err
 	}
 	var manifest Manifest
+	var summary ManifestPolicySummary
 	manifest.Version = version
 	err = filepath.WalkDir(absRoot, func(fileName string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -69,7 +52,7 @@ func GenerateManifest(rootDir, version string) (Manifest, error) {
 			return err
 		}
 		if entry.IsDir() {
-			if rel == StateDirName || strings.HasPrefix(rel, StateDirName+"/") {
+			if isStatePath(rel) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -80,6 +63,12 @@ func GenerateManifest(rootDir, version string) (Manifest, error) {
 		if entry.Type()&os.ModeType != 0 {
 			return nil
 		}
+		summary.ScannedCount++
+		if !policy.ShouldPublish(rel) {
+			summary.ExcludedCount++
+			return nil
+		}
+		summary.IncludedCount++
 		fileEntry, err := fileEntryForPath(absRoot, fileName)
 		if err != nil {
 			return err
@@ -88,10 +77,10 @@ func GenerateManifest(rootDir, version string) (Manifest, error) {
 		return nil
 	})
 	if err != nil {
-		return Manifest{}, err
+		return Manifest{}, ManifestPolicySummary{}, err
 	}
 	sortEntries(manifest.Files)
-	return manifest, nil
+	return manifest, summary, nil
 }
 
 func NormalizeManifest(manifest Manifest) (Manifest, map[string]FileEntry, error) {
@@ -149,7 +138,7 @@ func (r *planProgressReporter) advance(path string) {
 }
 
 func CompareManifests(rootDir string, installed *Manifest, remote Manifest) (Plan, error) {
-	return CompareManifestsWithProgress(rootDir, installed, remote, 1, nil)
+	return CompareManifestsWithPolicy(rootDir, installed, remote, DefaultFilePolicy(), 1, nil)
 }
 
 type compareAction uint8
@@ -164,10 +153,15 @@ type compareRemoteResult struct {
 	action       compareAction
 	entry        FileEntry
 	downloadSize int64
+	preserved    bool
 	err          error
 }
 
 func CompareManifestsWithProgress(rootDir string, installed *Manifest, remote Manifest, workers int, progress func(ProgressEvent)) (Plan, error) {
+	return CompareManifestsWithPolicy(rootDir, installed, remote, DefaultFilePolicy(), workers, progress)
+}
+
+func CompareManifestsWithPolicy(rootDir string, installed *Manifest, remote Manifest, policy FilePolicy, workers int, progress func(ProgressEvent)) (Plan, error) {
 	remote, remoteMap, err := NormalizeManifest(remote)
 	if err != nil {
 		return Plan{}, err
@@ -176,7 +170,7 @@ func CompareManifestsWithProgress(rootDir string, installed *Manifest, remote Ma
 	if installed == nil {
 		plan.FirstInstallRecovery = true
 		reporter := newPlanProgressReporter(len(remote.Files), progress)
-		results := compareRemoteEntries(rootDir, remote.Files, nil, workers, reporter)
+		results := compareRemoteEntries(rootDir, remote.Files, nil, policy, workers, reporter)
 		for _, result := range results {
 			if result.err != nil {
 				return Plan{}, result.err
@@ -194,7 +188,7 @@ func CompareManifestsWithProgress(rootDir string, installed *Manifest, remote Ma
 		return Plan{}, err
 	}
 	reporter := newPlanProgressReporter(len(remote.Files)+len(installedNormalized.Files), progress)
-	results := compareRemoteEntries(rootDir, remote.Files, installedMap, workers, reporter)
+	results := compareRemoteEntries(rootDir, remote.Files, installedMap, policy, workers, reporter)
 	for _, result := range results {
 		if result.err != nil {
 			return Plan{}, result.err
@@ -207,16 +201,23 @@ func CompareManifestsWithProgress(rootDir string, installed *Manifest, remote Ma
 			plan.Modify = append(plan.Modify, result.entry)
 			plan.DownloadSize += result.downloadSize
 		}
+		if result.preserved {
+			plan.PreservedModify++
+		}
 	}
 	for _, installedEntry := range installedNormalized.Files {
 		key := manifestKey(installedEntry.Path)
-		// 元数据文件和用户配置文件都不删除
-		if IsMetadataFile(installedEntry.Path) || IsUserConfigFile(installedEntry.Path) {
+		// 元数据是不受管系统不变量；用户文件删除保护由显式策略决定。
+		if IsMetadataFile(installedEntry.Path) {
 			reporter.advance(installedEntry.Path)
 			continue
 		}
 		if _, exists := remoteMap[key]; !exists {
-			plan.Delete = append(plan.Delete, installedEntry)
+			if policy.ShouldPreserve(installedEntry.Path) {
+				plan.PreservedDelete++
+			} else {
+				plan.Delete = append(plan.Delete, installedEntry)
+			}
 		}
 		reporter.advance(installedEntry.Path)
 	}
@@ -226,7 +227,7 @@ func CompareManifestsWithProgress(rootDir string, installed *Manifest, remote Ma
 	return plan, nil
 }
 
-func compareRemoteEntries(rootDir string, remoteFiles []FileEntry, installedMap map[string]FileEntry, workers int, reporter *planProgressReporter) []compareRemoteResult {
+func compareRemoteEntries(rootDir string, remoteFiles []FileEntry, installedMap map[string]FileEntry, policy FilePolicy, workers int, reporter *planProgressReporter) []compareRemoteResult {
 	if workers <= 0 {
 		workers = 1
 	}
@@ -242,7 +243,7 @@ func compareRemoteEntries(rootDir string, remoteFiles []FileEntry, installedMap 
 	worker := func() {
 		defer wg.Done()
 		for item := range jobs {
-			results[item.index] = compareRemoteEntry(rootDir, item.entry, installedMap)
+			results[item.index] = compareRemoteEntry(rootDir, item.entry, installedMap, policy)
 			reporter.advance(item.entry.Path)
 		}
 	}
@@ -259,7 +260,7 @@ func compareRemoteEntries(rootDir string, remoteFiles []FileEntry, installedMap 
 	return results
 }
 
-func compareRemoteEntry(rootDir string, remoteEntry FileEntry, installedMap map[string]FileEntry) compareRemoteResult {
+func compareRemoteEntry(rootDir string, remoteEntry FileEntry, installedMap map[string]FileEntry, policy FilePolicy) compareRemoteResult {
 	if IsMetadataFile(remoteEntry.Path) {
 		return compareRemoteResult{}
 	}
@@ -301,7 +302,7 @@ func compareRemoteEntry(rootDir string, remoteEntry FileEntry, installedMap map[
 		}
 		return compareRemoteResult{action: compareAdd, entry: remoteEntry, downloadSize: remoteEntry.Size}
 	case !sameEntry(installedEntry, remoteEntry):
-		if IsUserConfigFile(remoteEntry.Path) {
+		if policy.ShouldPreserve(remoteEntry.Path) {
 			// 智能合并：检查用户是否修改过本地文件
 			target, err := installPath(rootDir, remoteEntry.Path)
 			if err != nil {
@@ -317,7 +318,7 @@ func compareRemoteEntry(rootDir string, remoteEntry FileEntry, installedMap map[
 				return compareRemoteResult{action: compareModify, entry: remoteEntry, downloadSize: remoteEntry.Size}
 			}
 			// 用户修改过，跳过覆盖，保留用户版本
-			return compareRemoteResult{}
+			return compareRemoteResult{preserved: true}
 		}
 		return compareRemoteResult{action: compareModify, entry: remoteEntry, downloadSize: remoteEntry.Size}
 	default:
