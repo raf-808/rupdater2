@@ -56,10 +56,10 @@ func Run(ctx context.Context, opts Options) error {
 		if opts.CompleteSelfUpdate {
 			return completeSelfUpdate(rootDir, opts.SelfUpdateTarget, opts.SelfUpdatePending, ui)
 		}
-		if err := maybeHandoffSelfUpdate(rootDir, opts, ui); err != nil {
+		if err := recoverIfNeeded(stateDir, rootDir, ui); err != nil {
 			return err
 		}
-		if err := recoverIfNeeded(stateDir, rootDir, ui); err != nil {
+		if err := maybeHandoffSelfUpdate(rootDir, opts, ui); err != nil {
 			return err
 		}
 		return runUpdate(ctx, rootDir, stateDir, exePath, opts, ui)
@@ -141,13 +141,13 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 		return err
 	}
 
-	plan, err := CompareManifestsWithPolicy(rootDir, installed, remoteManifest, policy, opts.Workers, ui.Progress)
+	plan, planSummary, err := CompareManifestsWithPolicySummary(rootDir, installed, remoteManifest, policy, opts.Workers, ui.Progress)
 	if err != nil {
 		return err
 	}
 	debugLog(opts.Debug,
 		"policy_plan_summary add_count=%d modify_count=%d delete_count=%d preserved_modify=%d preserved_delete=%d",
-		len(plan.Add), len(plan.Modify), len(plan.Delete), plan.PreservedModify, plan.PreservedDelete)
+		len(plan.Add), len(plan.Modify), len(plan.Delete), planSummary.PreservedModify, planSummary.PreservedDelete)
 	plan.CurrentVersion = version.Version
 	plan.LatestVersion = latest.Version
 	for _, entry := range plan.Delete {
@@ -250,7 +250,7 @@ func loadPolicyForPlan(ctx context.Context, stateDir, filesBaseURL string, clien
 	}
 
 	candidate := filepath.Join(stateDir, PolicyCandidateName)
-	rawURL, err := fileDownloadURL(filesBaseURL, PolicyFileName)
+	rawURL, err := fileDownloadURL(filesBaseURL, remoteEntry.Path)
 	if err != nil {
 		wrapped := policyError("policy_download_failed", "构造策略下载地址失败：%v", err)
 		debugPolicyLoadFailure(debug, "remote", wrapped)

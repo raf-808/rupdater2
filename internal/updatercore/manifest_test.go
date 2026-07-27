@@ -232,23 +232,30 @@ func TestCompareManifestsWithPolicyProtectsOnlyUserModifiedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	single, err := CompareManifestsWithPolicy(root, &installed, remote, policy, 1, nil)
+	single, singleSummary, err := CompareManifestsWithPolicySummary(root, &installed, remote, policy, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	parallel, err := CompareManifestsWithPolicy(root, &installed, remote, policy, 4, nil)
+	parallel, parallelSummary, err := CompareManifestsWithPolicySummary(root, &installed, remote, policy, 4, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, plan := range map[string]Plan{"single": single, "parallel": parallel} {
+	for name, result := range map[string]struct {
+		plan    Plan
+		summary PolicyPlanSummary
+	}{
+		"single":   {plan: single, summary: singleSummary},
+		"parallel": {plan: parallel, summary: parallelSummary},
+	} {
+		plan := result.plan
 		if len(plan.Modify) != 2 || plan.Modify[0].Path != "clean.ini" || plan.Modify[1].Path != "system.ini" {
 			t.Fatalf("%s unexpected modify: %#v", name, plan.Modify)
 		}
 		if len(plan.Delete) != 0 {
 			t.Fatalf("%s protected delete unexpectedly planned: %#v", name, plan.Delete)
 		}
-		if plan.PreservedModify != 1 || plan.PreservedDelete != 1 {
-			t.Fatalf("%s preserved counts = %d/%d", name, plan.PreservedModify, plan.PreservedDelete)
+		if result.summary.PreservedModify != 1 || result.summary.PreservedDelete != 1 {
+			t.Fatalf("%s preserved counts = %d/%d", name, result.summary.PreservedModify, result.summary.PreservedDelete)
 		}
 	}
 }

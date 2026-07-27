@@ -47,14 +47,14 @@ type VersionState struct {
 }
 
 type Options struct {
-	RootDir      string
-	Silent       bool
-	Debug        bool
-	AutoConfirm  bool
-	Workers      int
-	Client       *http.Client
-	UI           UI
-	StateDir     string
+	RootDir     string
+	Silent      bool
+	Debug       bool
+	AutoConfirm bool
+	Workers     int
+	Client      *http.Client
+	UI          UI
+	StateDir    string
 	KeepStateDir bool
 
 	CompleteSelfUpdate bool
@@ -73,8 +73,6 @@ type Plan struct {
 	DownloadSize         int64
 	FirstInstallRecovery bool
 	RemoteManifest       Manifest
-	PreservedModify      int
-	PreservedDelete      int
 }
 
 type Session struct {

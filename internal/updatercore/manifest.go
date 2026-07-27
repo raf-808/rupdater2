@@ -24,6 +24,11 @@ type ManifestPolicySummary struct {
 	ExcludedCount int
 }
 
+type PolicyPlanSummary struct {
+	PreservedModify int
+	PreservedDelete int
+}
+
 func GenerateManifest(rootDir, version string) (Manifest, error) {
 	manifest, _, err := GenerateManifestWithPolicy(rootDir, version, DefaultFilePolicy())
 	return manifest, err
@@ -162,6 +167,16 @@ func CompareManifestsWithProgress(rootDir string, installed *Manifest, remote Ma
 }
 
 func CompareManifestsWithPolicy(rootDir string, installed *Manifest, remote Manifest, policy FilePolicy, workers int, progress func(ProgressEvent)) (Plan, error) {
+	return compareManifestsWithPolicy(rootDir, installed, remote, policy, workers, progress, nil)
+}
+
+func CompareManifestsWithPolicySummary(rootDir string, installed *Manifest, remote Manifest, policy FilePolicy, workers int, progress func(ProgressEvent)) (Plan, PolicyPlanSummary, error) {
+	var summary PolicyPlanSummary
+	plan, err := compareManifestsWithPolicy(rootDir, installed, remote, policy, workers, progress, &summary)
+	return plan, summary, err
+}
+
+func compareManifestsWithPolicy(rootDir string, installed *Manifest, remote Manifest, policy FilePolicy, workers int, progress func(ProgressEvent), summary *PolicyPlanSummary) (Plan, error) {
 	remote, remoteMap, err := NormalizeManifest(remote)
 	if err != nil {
 		return Plan{}, err
@@ -202,7 +217,9 @@ func CompareManifestsWithPolicy(rootDir string, installed *Manifest, remote Mani
 			plan.DownloadSize += result.downloadSize
 		}
 		if result.preserved {
-			plan.PreservedModify++
+			if summary != nil {
+				summary.PreservedModify++
+			}
 		}
 	}
 	for _, installedEntry := range installedNormalized.Files {
@@ -214,7 +231,9 @@ func CompareManifestsWithPolicy(rootDir string, installed *Manifest, remote Mani
 		}
 		if _, exists := remoteMap[key]; !exists {
 			if policy.ShouldPreserve(installedEntry.Path) {
-				plan.PreservedDelete++
+				if summary != nil {
+					summary.PreservedDelete++
+				}
 			} else {
 				plan.Delete = append(plan.Delete, installedEntry)
 			}

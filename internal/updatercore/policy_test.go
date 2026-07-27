@@ -97,6 +97,10 @@ func TestParseFilePolicyStrictValidation(t *testing.T) {
 
 func TestDefaultFilePolicyIsCompatibleAndConcurrentReadSafe(t *testing.T) {
 	policy := DefaultFilePolicy()
+	if len(policy.Preserve.Include.Files) != 6 || len(policy.Preserve.Include.Extensions) != 10 {
+		t.Fatalf("default compatibility rules = %d files/%d extensions, want 6/10",
+			len(policy.Preserve.Include.Files), len(policy.Preserve.Include.Extensions))
+	}
 	for _, path := range []string{
 		"AimanServer/webgemini_server_v2/config/config.json",
 		"U-Geminiserver_core/lan.txt",
