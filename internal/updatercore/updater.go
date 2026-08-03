@@ -380,12 +380,19 @@ func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, cli
 	if len(entries) == 0 {
 		return nil
 	}
-	if err := os.RemoveAll(filepath.Join(stateDir, "staging")); err != nil {
+
+	stagingDir := filepath.Join(stateDir, "staging")
+	
+	// 确保 staging 目录存在
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Join(stateDir, "staging"), 0o755); err != nil {
-		return err
-	}
+
+	// 清理临时文件（上次下载中断留下的 .download 文件）
+	cleanupStagingTempFiles(stagingDir)
+
+	// 清理不再需要的文件（不在当前 manifest 中的文件）
+	cleanupStagingOrphans(stagingDir, entries, rootDir)
 
 	var bytesTotal int64
 	for _, entry := range entries {
@@ -417,6 +424,33 @@ func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, cli
 				errs <- err
 				continue
 			}
+			
+			// 检查文件是否已存在且验证通过
+			ok, err := VerifyFile(dest, item.entry)
+			if err != nil && !os.IsNotExist(err) {
+				errs <- fmt.Errorf("验证已存在文件失败：%s：%w", item.entry.Path, err)
+				continue
+			}
+			
+			if ok {
+				// 文件已存在且验证通过，跳过下载，直接更新进度
+				progressMu.Lock()
+				completed++
+				newBytesDone := atomic.AddInt64(&bytesDone, item.entry.Size)
+				ui.Progress(ProgressEvent{
+					Phase:          "Stage",
+					CurrentFile:    item.entry.Path + " (已缓存)",
+					CompletedFiles: int(completed),
+					TotalFiles:     len(entries),
+					BytesDone:      newBytesDone,
+					BytesTotal:     bytesTotal,
+					SpeedBytes:     0, // 已缓存文件不计入下载速度
+				})
+				progressMu.Unlock()
+				continue
+			}
+			
+			// 文件不存在或验证失败，执行下载
 			rawURL, err := fileDownloadURL(filesBaseURL, item.entry.Path)
 			if err != nil {
 				errs <- err
@@ -673,6 +707,46 @@ func restoreStateFile(fileName string, data []byte, existed bool) error {
 		return err
 	}
 	return os.WriteFile(fileName, data, 0o644)
+}
+
+// cleanupStagingTempFiles 清理 staging 目录中的临时文件（.download 文件）
+func cleanupStagingTempFiles(stagingDir string) {
+	_ = filepath.Walk(stagingDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() && strings.HasSuffix(path, ".download") {
+			_ = os.Remove(path)
+		}
+		return nil
+	})
+}
+
+// cleanupStagingOrphans 清理 staging 目录中不在当前 manifest 中的文件
+func cleanupStagingOrphans(stagingDir string, entries []FileEntry, rootDir string) {
+	// 构建期望的文件路径集合
+	expected := make(map[string]bool)
+	for _, entry := range entries {
+		staged, err := stagingPath(rootDir, entry.Path)
+		if err != nil {
+			continue
+		}
+		expected[staged] = true
+	}
+
+	// 删除不在期望集合中的文件
+	_ = filepath.Walk(stagingDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if !expected[path] {
+			_ = os.Remove(path)
+		}
+		return nil
+	})
 }
 
 func cleanupBeforeRootChange(stateDir string) {

@@ -60,7 +60,7 @@ func fetchJSON(ctx context.Context, client *http.Client, rawURL string, target a
 		if resp.StatusCode != http.StatusOK {
 			return fmt.Errorf("HTTP 状态异常：%s", resp.Status)
 		}
-		decoder := json.NewDecoder(io.LimitReader(resp.Body, 32*1024*1024))
+		decoder := json.NewDecoder(io.LimitReader(resp.Body, 128*1024*1024))
 		decoder.DisallowUnknownFields()
 		return decoder.Decode(target)
 	})
@@ -80,6 +80,16 @@ func fileDownloadURL(baseURL, rel string) (string, error) {
 }
 
 func downloadAndVerify(ctx context.Context, client *http.Client, rawURL, dest string, entry FileEntry, progress func(int64)) error {
+	// 先检查文件是否已存在且验证通过
+	ok, err := VerifyFile(dest, entry)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("验证已存在文件失败：%w", err)
+	}
+	if ok {
+		// 文件已存在且验证通过，跳过下载
+		return nil
+	}
+
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := downloadFile(ctx, client, rawURL, dest, progress); err != nil {

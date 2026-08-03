@@ -792,3 +792,184 @@ func assertNotExists(t *testing.T, fileName string) {
 		t.Fatalf("%s exists or stat failed unexpectedly: %v", fileName, err)
 	}
 }
+
+func TestStagingReusesExistingFiles(t *testing.T) {
+	root := t.TempDir()
+	
+	// 准备测试文件
+	file1 := []byte("file1 content")
+	file2 := []byte("file2 content")
+	
+	// 创建 staging 目录并预先放置 file1
+	stagingDir := statePath(root, "staging")
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	
+	file1Entry := FileEntry{
+		Path:     "file1.txt",
+		Size:     int64(len(file1)),
+		HeadHash: mustHash(t, file1),
+		TailHash: mustHash(t, file1),
+	}
+	
+	stagedFile1, err := stagingPath(root, file1Entry.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	
+	// 写入已存在的文件（模拟之前下载成功的文件）
+	if err := os.WriteFile(stagedFile1, file1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	
+	// 创建 manifest 和服务器
+	file2Entry := FileEntry{
+		Path:     "file2.txt",
+		Size:     int64(len(file2)),
+		HeadHash: mustHash(t, file2),
+		TailHash: mustHash(t, file2),
+	}
+	
+	manifest := Manifest{
+		Version: "2",
+		Files:   []FileEntry{file1Entry, file2Entry},
+	}
+	
+	files := map[string][]byte{
+		"file1.txt": file1,
+		"file2.txt": file2,
+	}
+	
+	server := updateServer(t, manifest, files)
+	defer server.Close()
+	
+	// 创建初始状态
+	writeInitialState(t, root, "1", Manifest{Version: "1"}, server.URL+"/latest.json")
+	
+	// 记录进度事件
+	ui := &recordingUI{}
+	
+	// 运行更新
+	opts := Options{
+		RootDir: root,
+		Client:  server.Client(),
+		Workers: 2,
+		UI:      ui,
+	}
+	
+	if err := Run(context.Background(), opts); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	
+	// 验证文件已正确安装
+	assertFileContent(t, filepath.Join(root, "file1.txt"), file1)
+	assertFileContent(t, filepath.Join(root, "file2.txt"), file2)
+	
+	// 验证进度事件中包含 "(已缓存)" 标记
+	hasCachedEvent := false
+	for _, event := range ui.progresses {
+		if strings.Contains(event.CurrentFile, "file1.txt") && strings.Contains(event.CurrentFile, "已缓存") {
+			hasCachedEvent = true
+			break
+		}
+	}
+	
+	if !hasCachedEvent {
+		t.Errorf("expected progress event with 'file1.txt (已缓存)', got:\n%+v", ui.progresses)
+	}
+}
+
+func TestStagingCleansTempFiles(t *testing.T) {
+	root := t.TempDir()
+	
+	// 创建 staging 目录
+	stagingDir := statePath(root, "staging")
+	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	
+	// 创建临时文件（模拟上次下载中断）
+	tempFile := filepath.Join(stagingDir, "test.txt.download")
+	if err := os.WriteFile(tempFile, []byte("temp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	
+	// 创建不在 manifest 中的文件（模拟旧版本文件）
+	orphanFile := filepath.Join(stagingDir, "old_file.txt")
+	if err := os.WriteFile(orphanFile, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	
+	// 准备更新
+	file := []byte("test content")
+	fileEntry := FileEntry{
+		Path:     "test.txt",
+		Size:     int64(len(file)),
+		HeadHash: mustHash(t, file),
+		TailHash: mustHash(t, file),
+	}
+	
+	manifest := Manifest{
+		Version: "2",
+		Files:   []FileEntry{fileEntry},
+	}
+	
+	files := map[string][]byte{
+		"test.txt": file,
+	}
+	
+	server := updateServer(t, manifest, files)
+	defer server.Close()
+	
+	// 创建初始状态
+	writeInitialState(t, root, "1", Manifest{Version: "1"}, server.URL+"/latest.json")
+	
+	// 运行更新
+	opts := Options{
+		RootDir: root,
+		Client:  server.Client(),
+		Workers: 2,
+		UI:      testUI{},
+	}
+	
+	if err := Run(context.Background(), opts); err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	
+	// 验证临时文件和孤儿文件被清理
+	assertNotExists(t, tempFile)
+	assertNotExists(t, orphanFile)
+	
+	// 验证文件已正确安装
+	assertFileContent(t, filepath.Join(root, "test.txt"), file)
+}
+
+func mustHash(t *testing.T, data []byte) string {
+	t.Helper()
+	file, err := os.CreateTemp(t.TempDir(), "hash_*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(file.Name())
+	defer file.Close()
+	
+	if _, err := file.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	
+	size, head, tail, err := HashFile(file.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	
+	if size != int64(len(data)) {
+		t.Fatalf("size mismatch: %d != %d", size, len(data))
+	}
+	
+	if head != tail {
+		t.Fatalf("head != tail for small file: %s != %s", head, tail)
+	}
+	
+	return head
+}
