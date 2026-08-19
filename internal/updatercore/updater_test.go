@@ -627,7 +627,7 @@ func TestPolicyFileIsRecoveredAfterSwitchOrCommitFailure(t *testing.T) {
 		if err := os.MkdirAll(filepath.Join(stateDir, "installed_manifest.json"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := commitWithProgress(stateDir, Manifest{Version: "2", Files: plan.Add}, "2", testUI{}, false); err == nil {
+		if err := commitWithProgress(stateDir, Manifest{Version: "2", Files: plan.Add}, nil, FilePolicy{}, nil, "2", testUI{}, false); err == nil {
 			t.Fatal("expected commit failure")
 		}
 		if err := recoverFromSession(stateDir, root, session, testUI{}); err != nil {
@@ -972,4 +972,242 @@ func mustHash(t *testing.T, data []byte) string {
 	}
 	
 	return head
+}
+
+// --- Optional 文件测试 ---
+
+// optionalPolicyData 返回一个将 optional_file.txt 标记为可选的策略
+func optionalPolicyData() []byte {
+	return []byte(`{
+		"schema_version": 1,
+		"publish": {"include": {}, "exclude": {}},
+		"preserve": {"include": {}, "exclude": {"files": ["updater-policy.json"]}},
+		"optional": {"include": {"files": ["optional_file.txt"]}, "exclude": {}}
+	}`)
+}
+
+// TestOptionalAdd404SkipsDownloadAndOmitsFromManifest: 可选文件 add+404 → 跳过，不写入 installed_manifest
+func TestOptionalAdd404SkipsDownloadAndOmitsFromManifest(t *testing.T) {
+	root := t.TempDir()
+	policyData := optionalPolicyData()
+
+	// 远端清单包含 optional_file.txt，但服务端不提供该文件
+	remote := Manifest{Version: "2.0.0", Files: []FileEntry{
+		entryForBytes("normal.txt", []byte("normal")),
+		entryForBytes("optional_file.txt", []byte("optional")),
+		entryForBytes(PolicyFileName, policyData),
+	}}
+	server := updateServer(t, remote, map[string][]byte{
+		"normal.txt":         []byte("normal"),
+		PolicyFileName:       policyData,
+		// optional_file.txt 故意不提供 → 404
+	})
+	defer server.Close()
+
+	installed := Manifest{Version: "1.0.0", Files: []FileEntry{
+		entryForBytes(PolicyFileName, policyData),
+	}}
+	writeInitialState(t, root, "1.0.0", installed, server.URL+"/latest.json")
+
+	err := Run(context.Background(), Options{
+		RootDir:     root,
+		AutoConfirm: true,
+		Silent:      true,
+		UI:          testUI{},
+		ExePath:     filepath.Join(root, "Updater.exe"),
+	})
+	if err != nil {
+		t.Fatalf("optional add 404 should not fail: %v", err)
+	}
+
+	// normal.txt 应存在
+	assertFileContent(t, filepath.Join(root, "normal.txt"), []byte("normal"))
+	// optional_file.txt 不应存在（404 跳过，本地原本没有）
+	assertNotExists(t, filepath.Join(root, "optional_file.txt"))
+
+	// installed_manifest 不应包含 optional_file.txt
+	var installedManifest Manifest
+	if err := ReadJSONFile(statePath(root, "installed_manifest.json"), &installedManifest); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range installedManifest.Files {
+		if entry.Path == "optional_file.txt" {
+			t.Fatalf("optional_file.txt should not be in installed_manifest (add+404)")
+		}
+	}
+}
+
+// TestOptionalModify404PreservesLocalFileAndOldManifestRecord: 可选文件 modify+404 → 保留本地文件和旧记录
+func TestOptionalModify404PreservesLocalFileAndOldManifestRecord(t *testing.T) {
+	root := t.TempDir()
+	policyData := optionalPolicyData()
+	oldContent := []byte("old optional")
+	newContent := []byte("new optional")
+
+	// 本地已有 optional_file.txt（旧版本）
+	writeTestFile(t, filepath.Join(root, "optional_file.txt"), oldContent)
+
+	installed := Manifest{Version: "1.0.0", Files: []FileEntry{
+		entryForBytes("optional_file.txt", oldContent),
+		entryForBytes(PolicyFileName, policyData),
+	}}
+	// 远端清单有新版本，但服务端不提供该文件
+	remote := Manifest{Version: "2.0.0", Files: []FileEntry{
+		entryForBytes("optional_file.txt", newContent),
+		entryForBytes(PolicyFileName, policyData),
+	}}
+	server := updateServer(t, remote, map[string][]byte{
+		PolicyFileName: policyData,
+		// optional_file.txt 故意不提供 → 404
+	})
+	defer server.Close()
+
+	writeInitialState(t, root, "1.0.0", installed, server.URL+"/latest.json")
+
+	err := Run(context.Background(), Options{
+		RootDir:     root,
+		AutoConfirm: true,
+		Silent:      true,
+		UI:          testUI{},
+		ExePath:     filepath.Join(root, "Updater.exe"),
+	})
+	if err != nil {
+		t.Fatalf("optional modify 404 should not fail: %v", err)
+	}
+
+	// 本地文件应保持旧内容
+	assertFileContent(t, filepath.Join(root, "optional_file.txt"), oldContent)
+
+	// installed_manifest 应保留旧记录（旧哈希）
+	var installedManifest Manifest
+	if err := ReadJSONFile(statePath(root, "installed_manifest.json"), &installedManifest); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, entry := range installedManifest.Files {
+		if entry.Path == "optional_file.txt" {
+			found = true
+			oldHash := sha256Hex(oldContent)
+			if entry.HeadHash != oldHash || entry.TailHash != oldHash {
+				t.Fatalf("installed_manifest has wrong hash for optional_file.txt: got %s/%s, want %s",
+					entry.HeadHash, entry.TailHash, oldHash)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("optional_file.txt should be preserved in installed_manifest (modify+404)")
+	}
+}
+
+// TestOptionalDeleteSkipsRemoval: 可选文件在远端清单中不存在 → 跳过删除，保留本地文件和记录
+func TestOptionalDeleteSkipsRemoval(t *testing.T) {
+	root := t.TempDir()
+	policyData := optionalPolicyData()
+	localContent := []byte("local optional")
+
+	// 本地已有 optional_file.txt
+	writeTestFile(t, filepath.Join(root, "optional_file.txt"), localContent)
+
+	installed := Manifest{Version: "1.0.0", Files: []FileEntry{
+		entryForBytes("optional_file.txt", localContent),
+		entryForBytes("normal.txt", []byte("old normal")),
+		entryForBytes(PolicyFileName, policyData),
+	}}
+	// 远端清单删除了 optional_file.txt
+	remote := Manifest{Version: "2.0.0", Files: []FileEntry{
+		entryForBytes("normal.txt", []byte("new normal")),
+		entryForBytes(PolicyFileName, policyData),
+	}}
+	server := updateServer(t, remote, map[string][]byte{
+		"normal.txt":   []byte("new normal"),
+		PolicyFileName: policyData,
+	})
+	defer server.Close()
+
+	writeInitialState(t, root, "1.0.0", installed, server.URL+"/latest.json")
+
+	err := Run(context.Background(), Options{
+		RootDir:     root,
+		AutoConfirm: true,
+		Silent:      true,
+		UI:          testUI{},
+		ExePath:     filepath.Join(root, "Updater.exe"),
+	})
+	if err != nil {
+		t.Fatalf("optional delete should not fail: %v", err)
+	}
+
+	// optional_file.txt 应仍存在
+	assertFileContent(t, filepath.Join(root, "optional_file.txt"), localContent)
+
+	// installed_manifest 应仍包含 optional_file.txt 的旧记录
+	var installedManifest Manifest
+	if err := ReadJSONFile(statePath(root, "installed_manifest.json"), &installedManifest); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, entry := range installedManifest.Files {
+		if entry.Path == "optional_file.txt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("optional_file.txt should be preserved in installed_manifest (delete skipped)")
+	}
+}
+
+// TestBuildInstalledManifestMergeLogic: 单元测试 buildInstalledManifest 合并逻辑
+func TestBuildInstalledManifestMergeLogic(t *testing.T) {
+	policyData := optionalPolicyData()
+	policy, err := ParseFilePolicy(policyData)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldEntry := entryForBytes("optional_file.txt", []byte("old"))
+	normalEntry := entryForBytes("normal.txt", []byte("normal"))
+
+	oldInstalled := &Manifest{Version: "1.0.0", Files: []FileEntry{oldEntry, normalEntry}}
+
+	// 远端清单有 normal.txt（更新）和 optional_file.txt（新版本），但 optional 404 了
+	remoteEntry := entryForBytes("optional_file.txt", []byte("new"))
+	remoteNormal := entryForBytes("normal.txt", []byte("new normal"))
+	remote := Manifest{Version: "2.0.0", Files: []FileEntry{remoteEntry, remoteNormal}}
+
+	merged := buildInstalledManifest(remote, oldInstalled, policy, []string{"optional_file.txt"})
+
+	// normal.txt 应使用远端版本
+	// optional_file.txt 应使用旧版本（modify+404）
+	mMap := make(map[string]FileEntry)
+	for _, e := range merged.Files {
+		mMap[manifestKey(e.Path)] = e
+	}
+	if mMap["normal.txt"].HeadHash != remoteNormal.HeadHash {
+		t.Fatal("normal.txt should use remote entry")
+	}
+	if mMap["optional_file.txt"].HeadHash != oldEntry.HeadHash {
+		t.Fatal("optional_file.txt should use old entry (modify+404)")
+	}
+
+	// 测试 add+404：旧清单没有该文件
+	oldInstalled2 := &Manifest{Version: "1.0.0", Files: []FileEntry{normalEntry}}
+	merged2 := buildInstalledManifest(remote, oldInstalled2, policy, []string{"optional_file.txt"})
+	for _, e := range merged2.Files {
+		if e.Path == "optional_file.txt" {
+			t.Fatal("optional_file.txt should not be in manifest (add+404)")
+		}
+	}
+
+	// 测试 delete skipped：远端没有 optional_file.txt
+	remoteNoOpt := Manifest{Version: "2.0.0", Files: []FileEntry{remoteNormal}}
+	merged3 := buildInstalledManifest(remoteNoOpt, oldInstalled, policy, nil)
+	found := false
+	for _, e := range merged3.Files {
+		if e.Path == "optional_file.txt" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("optional_file.txt should be preserved in manifest (delete skipped)")
+	}
 }
