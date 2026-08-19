@@ -173,7 +173,7 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 		return ErrUserCancelled
 	}
 
-	if err := stageFiles(ctx, rootDir, stateDir, latest.FilesBaseURL, opts.Client, opts.Workers, plan, ui); err != nil {
+	if err := stageFiles(ctx, rootDir, stateDir, latest.FilesBaseURL, opts.Client, opts.Workers, plan, policy, ui); err != nil {
 		cleanupBeforeRootChange(stateDir)
 		return err
 	}
@@ -374,7 +374,7 @@ func writeSession(stateDir string, session Session, phase string) error {
 	return WriteJSONAtomic(filepath.Join(stateDir, "session.json"), session)
 }
 
-func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, client *http.Client, workers int, plan Plan, ui UI) error {
+func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, client *http.Client, workers int, plan Plan, policy FilePolicy, ui UI) error {
 	entries := append([]FileEntry{}, plan.Add...)
 	entries = append(entries, plan.Modify...)
 	if len(entries) == 0 {
@@ -481,6 +481,22 @@ func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, cli
 				progressMu.Unlock()
 			}
 			if err := downloadAndVerify(ctx, client, rawURL, dest, item.entry, progressCb); err != nil {
+				if errors.Is(err, ErrNotFound) && policy.ShouldBeOptional(item.entry.Path) {
+					// 可选文件远端不存在，跳过
+					progressMu.Lock()
+					completed++
+					ui.Progress(ProgressEvent{
+						Phase:          "Stage",
+						CurrentFile:    item.entry.Path + " (云端缺失，已跳过)",
+						CompletedFiles: int(completed),
+						TotalFiles:     len(entries),
+						BytesDone:      atomic.LoadInt64(&bytesDone),
+						BytesTotal:     bytesTotal,
+						SpeedBytes:     0,
+					})
+					progressMu.Unlock()
+					continue
+				}
 				errs <- fmt.Errorf("下载失败：%s：%w", item.entry.Path, err)
 				continue
 			}
@@ -607,6 +623,10 @@ func switchFiles(rootDir, stateDir string, plan Plan, exePath string, session *S
 		staged, err := stagingPath(rootDir, entry.Path)
 		if err != nil {
 			return err
+		}
+		// 可选文件可能因远端 404 未下载，跳过
+		if _, err := os.Stat(staged); errors.Is(err, os.ErrNotExist) {
+			continue
 		}
 		if isSelfUpdaterEntry(rootDir, entry, exePath) {
 			pending := pendingSelfUpdatePath(rootDir)
