@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,9 +13,6 @@ import (
 	"strings"
 	"time"
 )
-
-// ErrNotFound 表示远端文件不存在（HTTP 404），可选文件可据此跳过。
-var ErrNotFound = errors.New("HTTP 404 Not Found")
 
 func defaultHTTPClient() *http.Client {
 	return &http.Client{Timeout: 15 * time.Minute}
@@ -97,9 +93,6 @@ func downloadAndVerify(ctx context.Context, client *http.Client, rawURL, dest st
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := downloadFile(ctx, client, rawURL, dest, progress); err != nil {
-			if errors.Is(err, ErrNotFound) {
-				return err // 404 不重试
-			}
 			lastErr = err
 			continue
 		}
@@ -159,9 +152,6 @@ func doDownload(ctx context.Context, client *http.Client, rawURL, dest string, l
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return ErrNotFound
-	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP 状态异常：%s", resp.Status)
 	}

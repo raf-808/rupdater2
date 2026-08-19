@@ -51,7 +51,6 @@ type FilePolicy struct {
 	SchemaVersion int           `json:"schema_version"`
 	Publish       PolicySection `json:"publish"`
 	Preserve      PolicySection `json:"preserve"`
-	Optional      PolicySection `json:"optional"`
 }
 
 type PolicySection struct {
@@ -75,7 +74,6 @@ type policyJSON struct {
 	SchemaVersion *int           `json:"schema_version"`
 	Publish       *policySection `json:"publish"`
 	Preserve      *policySection `json:"preserve"`
-	Optional      *policySection `json:"optional"`
 }
 
 type policySection struct {
@@ -120,9 +118,6 @@ func ParseFilePolicy(data []byte) (FilePolicy, error) {
 	}
 	if wire.Preserve != nil {
 		policy.Preserve = sectionFromJSON(*wire.Preserve)
-	}
-	if wire.Optional != nil {
-		policy.Optional = sectionFromJSON(*wire.Optional)
 	}
 	if err := normalizePolicy(&policy); err != nil {
 		return FilePolicy{}, err
@@ -193,15 +188,6 @@ func (p FilePolicy) ShouldPreserve(rawPath string) bool {
 	return p.Preserve.Include.matches(normalized) && !p.Preserve.Exclude.matches(normalized)
 }
 
-// ShouldBeOptional 判断文件是否为可选文件：可选文件在远端 404 时跳过下载，不视为错误。
-func (p FilePolicy) ShouldBeOptional(rawPath string) bool {
-	normalized, ok := policyMatchPath(rawPath)
-	if !ok || isMetadataPath(normalized) || isStatePath(normalized) || strings.EqualFold(normalized, PolicyFileName) {
-		return false
-	}
-	return p.Optional.Include.matches(normalized) && !p.Optional.Exclude.matches(normalized)
-}
-
 func sectionFromJSON(section policySection) PolicySection {
 	result := PolicySection{}
 	if section.Include != nil {
@@ -226,7 +212,6 @@ func normalizePolicy(policy *FilePolicy) error {
 	sets := []*MatchSet{
 		&policy.Publish.Include, &policy.Publish.Exclude,
 		&policy.Preserve.Include, &policy.Preserve.Exclude,
-		&policy.Optional.Include, &policy.Optional.Exclude,
 	}
 	for _, set := range sets {
 		if err := set.normalize(); err != nil {

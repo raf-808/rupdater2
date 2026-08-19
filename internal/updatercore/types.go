@@ -84,7 +84,6 @@ type Session struct {
 	BackedUp          []MovedFile `json:"backed_up"`
 	Switched          []MovedFile `json:"switched"`
 	PendingSelfUpdate string      `json:"pending_self_update,omitempty"`
-	SkippedOptional   []string    `json:"skipped_optional,omitempty"`
 	StartedAt         string      `json:"started_at"`
 }
 

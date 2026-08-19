@@ -146,8 +146,8 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 		return err
 	}
 	debugLog(opts.Debug,
-		"policy_plan_summary add_count=%d modify_count=%d delete_count=%d preserved_modify=%d preserved_delete=%d preserved_optional_delete=%d",
-		len(plan.Add), len(plan.Modify), len(plan.Delete), planSummary.PreservedModify, planSummary.PreservedDelete, planSummary.PreservedOptionalDelete)
+		"policy_plan_summary add_count=%d modify_count=%d delete_count=%d preserved_modify=%d preserved_delete=%d",
+		len(plan.Add), len(plan.Modify), len(plan.Delete), planSummary.PreservedModify, planSummary.PreservedDelete)
 	plan.CurrentVersion = version.Version
 	plan.LatestVersion = latest.Version
 	for _, entry := range plan.Delete {
@@ -157,7 +157,7 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 	}
 	if len(plan.Add) == 0 && len(plan.Modify) == 0 && len(plan.Delete) == 0 {
 		ui.Info("文件已与最新清单一致，正在提交版本状态。")
-		return commitWithProgress(stateDir, remoteManifest, installed, policy, nil, latest.Version, ui, opts.Debug)
+		return commitWithProgress(stateDir, remoteManifest, latest.Version, ui, opts.Debug)
 	}
 	if !ui.ConfirmPlan(plan) {
 		return ErrUserCancelled
@@ -173,7 +173,7 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 		return ErrUserCancelled
 	}
 
-	if err := stageFiles(ctx, rootDir, stateDir, latest.FilesBaseURL, opts.Client, opts.Workers, plan, policy, &session, ui); err != nil {
+	if err := stageFiles(ctx, rootDir, stateDir, latest.FilesBaseURL, opts.Client, opts.Workers, plan, ui); err != nil {
 		cleanupBeforeRootChange(stateDir)
 		return err
 	}
@@ -218,7 +218,7 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 	}
 
 	ui.Progress(ProgressEvent{Phase: "Commit"})
-	if err := commitWithProgress(stateDir, remoteManifest, installed, policy, session.SkippedOptional, latest.Version, ui, opts.Debug); err != nil {
+	if err := commitWithProgress(stateDir, remoteManifest, latest.Version, ui, opts.Debug); err != nil {
 		_ = recoverFromSession(stateDir, rootDir, session, ui)
 		return err
 	}
@@ -374,7 +374,7 @@ func writeSession(stateDir string, session Session, phase string) error {
 	return WriteJSONAtomic(filepath.Join(stateDir, "session.json"), session)
 }
 
-func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, client *http.Client, workers int, plan Plan, policy FilePolicy, session *Session, ui UI) error {
+func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, client *http.Client, workers int, plan Plan, ui UI) error {
 	entries := append([]FileEntry{}, plan.Add...)
 	entries = append(entries, plan.Modify...)
 	if len(entries) == 0 {
@@ -382,7 +382,7 @@ func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, cli
 	}
 
 	stagingDir := filepath.Join(stateDir, "staging")
-
+	
 	// 确保 staging 目录存在
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
 		return err
@@ -424,14 +424,14 @@ func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, cli
 				errs <- err
 				continue
 			}
-
+			
 			// 检查文件是否已存在且验证通过
 			ok, err := VerifyFile(dest, item.entry)
 			if err != nil && !os.IsNotExist(err) {
 				errs <- fmt.Errorf("验证已存在文件失败：%s：%w", item.entry.Path, err)
 				continue
 			}
-
+			
 			if ok {
 				// 文件已存在且验证通过，跳过下载，直接更新进度
 				progressMu.Lock()
@@ -449,7 +449,7 @@ func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, cli
 				progressMu.Unlock()
 				continue
 			}
-
+			
 			// 文件不存在或验证失败，执行下载
 			rawURL, err := fileDownloadURL(filesBaseURL, item.entry.Path)
 			if err != nil {
@@ -481,23 +481,6 @@ func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, cli
 				progressMu.Unlock()
 			}
 			if err := downloadAndVerify(ctx, client, rawURL, dest, item.entry, progressCb); err != nil {
-				if errors.Is(err, ErrNotFound) && policy.ShouldBeOptional(item.entry.Path) {
-					// 可选文件远端不存在，跳过并记录
-					session.SkippedOptional = append(session.SkippedOptional, item.entry.Path)
-					progressMu.Lock()
-					completed++
-					ui.Progress(ProgressEvent{
-						Phase:          "Stage",
-						CurrentFile:    item.entry.Path + " (云端缺失，已跳过)",
-						CompletedFiles: int(completed),
-						TotalFiles:     len(entries),
-						BytesDone:      atomic.LoadInt64(&bytesDone),
-						BytesTotal:     bytesTotal,
-						SpeedBytes:     0,
-					})
-					progressMu.Unlock()
-					continue
-				}
 				errs <- fmt.Errorf("下载失败：%s：%w", item.entry.Path, err)
 				continue
 			}
@@ -582,18 +565,10 @@ func backupFiles(rootDir, stateDir string, plan Plan, exePath string, session *S
 	if err := writeSession(stateDir, *session, "Backup"); err != nil {
 		return err
 	}
-	skippedSet := make(map[string]bool, len(session.SkippedOptional))
-	for _, p := range session.SkippedOptional {
-		skippedSet[manifestKey(p)] = true
-	}
 	entries := append([]FileEntry{}, plan.Modify...)
 	entries = append(entries, plan.Delete...)
 	for _, entry := range entries {
 		if isSelfUpdaterEntry(rootDir, entry, exePath) {
-			continue
-		}
-		// Stage 阶段 404 跳过的可选文件不备份（本地文件保留原位）
-		if skippedSet[manifestKey(entry.Path)] {
 			continue
 		}
 		source, err := installPath(rootDir, entry.Path)
@@ -632,10 +607,6 @@ func switchFiles(rootDir, stateDir string, plan Plan, exePath string, session *S
 		staged, err := stagingPath(rootDir, entry.Path)
 		if err != nil {
 			return err
-		}
-		// 可选文件可能因远端 404 未下载，跳过
-		if _, err := os.Stat(staged); errors.Is(err, os.ErrNotExist) {
-			continue
 		}
 		if isSelfUpdaterEntry(rootDir, entry, exePath) {
 			pending := pendingSelfUpdatePath(rootDir)
@@ -680,67 +651,15 @@ func switchFiles(rootDir, stateDir string, plan Plan, exePath string, session *S
 }
 
 func commit(stateDir string, manifest Manifest, version string) error {
-	return commitWithProgress(stateDir, manifest, nil, FilePolicy{}, nil, version, nil, false)
+	return commitWithProgress(stateDir, manifest, version, nil, false)
 }
 
-// buildInstalledManifest 合并远端清单与本地保留的可选文件记录，生成最终 installed_manifest。
-//   - skippedOptional: Stage 阶段 404 跳过的可选文件路径
-//   - 对 modify+404 的可选文件：保留旧记录（本地文件未变）
-//   - 对 add+404 的可选文件：不写入新清单（本地无文件）
-//   - 对远端已删除但 optional 的文件：保留旧记录（跳过删除）
-func buildInstalledManifest(remoteManifest Manifest, oldInstalled *Manifest, policy FilePolicy, skippedOptional []string) Manifest {
-	skippedSet := make(map[string]bool, len(skippedOptional))
-	for _, p := range skippedOptional {
-		skippedSet[manifestKey(p)] = true
-	}
-
-	oldMap := make(map[string]FileEntry)
-	if oldInstalled != nil {
-		for _, entry := range oldInstalled.Files {
-			oldMap[manifestKey(entry.Path)] = entry
-		}
-	}
-
-	remoteMap := make(map[string]bool, len(remoteManifest.Files))
-	var result []FileEntry
-
-	// 1. 远端清单中的文件
-	for _, entry := range remoteManifest.Files {
-		key := manifestKey(entry.Path)
-		remoteMap[key] = true
-		if skippedSet[key] {
-			if oldEntry, exists := oldMap[key]; exists {
-				// modify+404：本地文件未变，保留旧记录
-				result = append(result, oldEntry)
-			}
-			// add+404：本地无文件，不写入
-		} else {
-			result = append(result, entry)
-		}
-	}
-
-	// 2. 旧清单中不在远端清单的可选文件（跳过删除，保留记录）
-	if oldInstalled != nil {
-		for _, entry := range oldInstalled.Files {
-			key := manifestKey(entry.Path)
-			if !remoteMap[key] && policy.ShouldBeOptional(entry.Path) {
-				result = append(result, entry)
-			}
-		}
-	}
-
-	merged := Manifest{Version: remoteManifest.Version, Files: result}
-	sortEntries(merged.Files)
-	return merged
-}
-
-func commitWithProgress(stateDir string, remoteManifest Manifest, oldInstalled *Manifest, policy FilePolicy, skippedOptional []string, version string, ui UI, debug bool) error {
+func commitWithProgress(stateDir string, manifest Manifest, version string, ui UI, debug bool) error {
 	if ui != nil {
 		ui.Progress(ProgressEvent{Phase: "Commit", CurrentFile: "正在规范化清单"})
 	}
 	debugLog(debug, "commit: normalize start")
-	merged := buildInstalledManifest(remoteManifest, oldInstalled, policy, skippedOptional)
-	normalized, _, err := NormalizeManifest(merged)
+	normalized, _, err := NormalizeManifest(manifest)
 	if err != nil {
 		return err
 	}

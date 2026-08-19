@@ -25,9 +25,8 @@ type ManifestPolicySummary struct {
 }
 
 type PolicyPlanSummary struct {
-	PreservedModify        int
-	PreservedDelete        int
-	PreservedOptionalDelete int
+	PreservedModify int
+	PreservedDelete int
 }
 
 func GenerateManifest(rootDir, version string) (Manifest, error) {
@@ -234,10 +233,6 @@ func compareManifestsWithPolicy(rootDir string, installed *Manifest, remote Mani
 			if policy.ShouldPreserve(installedEntry.Path) {
 				if summary != nil {
 					summary.PreservedDelete++
-				}
-			} else if policy.ShouldBeOptional(installedEntry.Path) {
-				if summary != nil {
-					summary.PreservedOptionalDelete++
 				}
 			} else {
 				plan.Delete = append(plan.Delete, installedEntry)
