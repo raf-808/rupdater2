@@ -872,9 +872,6 @@ func (ui *DialogUI) handleMessage(hwnd uintptr, msg uint32, wParam uintptr, lPar
 		postQuit(0)
 		return 0
 
-	case WM_ERASEBKGND:
-		return 1
-
 	case WM_CTLCOLORSTATIC:
 		ui.mu.Lock()
 		isError := ui.isErrorState
