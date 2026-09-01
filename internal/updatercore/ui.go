@@ -18,6 +18,12 @@ type UI interface {
 	ShowVersionInfo(current, latest string)
 }
 
+// FileFailureUI is an optional UI capability for deciding what to do after a
+// file has exhausted the existing automatic download attempts.
+type FileFailureUI interface {
+	DecideFileFailure(ctx context.Context, failure FileFailure) FileFailureDecision
+}
+
 // GUIRunner is implemented by UIs that need a message loop on the main thread.
 type GUIRunner interface {
 	RunMessageLoop(work func(context.Context) error, ctx context.Context) error

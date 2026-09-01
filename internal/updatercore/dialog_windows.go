@@ -4,6 +4,7 @@ package updatercore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -25,6 +26,14 @@ type DialogUI struct {
 	doneChan    chan error
 	waitingFor  waitKind
 
+	pendingFileFailure  *FileFailure
+	lastFileFailure     *FileFailure
+	fileFailureChan     chan FileFailureDecision
+	fileFailureActive   bool
+	fileFailureRendered bool
+	hadFileFailure      bool
+	fallbackVisible     bool
+
 	mu                sync.Mutex
 	inUpdate          bool
 	updateDone        bool
@@ -42,13 +51,16 @@ type DialogUI struct {
 	lastUIUpdate      time.Time // UI 级别进度节流：上次实际刷新 Win32 控件的时间戳
 	lastProgressPhase string    // 上次刷新时的阶段，用于检测阶段切换（节流跳过时不更新）
 
-	workFunc        func(context.Context) error
-	ctxFunc         func() context.Context
-	font            uintptr
-	fontMedium      uintptr
-	postMessageFunc func(hwnd uintptr, msg uint32)
-	setTextFunc     func(hwnd uintptr, text string)
-	sendMessageFunc func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr
+	workFunc             func(context.Context) error
+	ctxFunc              func() context.Context
+	font                 uintptr
+	fontMedium           uintptr
+	postMessageFunc      func(hwnd uintptr, msg uint32)
+	setTextFunc          func(hwnd uintptr, text string)
+	sendMessageFunc      func(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr
+	foregroundWindowFunc func() uintptr
+	openURLFunc          func(string) error
+	copyTextFunc         func(string) error
 
 	// Control handles
 	hVersionLbl   uintptr
@@ -63,9 +75,14 @@ type DialogUI struct {
 	hStatusLbl    uintptr
 	hStart        uintptr
 	hCancel       uintptr
+	hRetry        uintptr
+	hSkip         uintptr
+	hSkipAll      uintptr
 	hKillProc     uintptr
 	hCloseBtn     uintptr
 	hRecheck      uintptr
+	hOpenFallback uintptr
+	hCopyFallback uintptr
 	hStatusPanel  uintptr
 	hVerGroupBox  uintptr
 	hProgGroupBox uintptr
@@ -92,22 +109,28 @@ const (
 	waitNone waitKind = iota
 	waitPlan
 	waitLocked
+	waitFileFailure
 )
 
 const (
-	dialogMarginX   = 24
-	dialogRowH      = 28
-	dialogBtnH      = 36
-	dialogLabelW    = 532
-	dialogProgressH = 16
-	dialogGroupPad  = 20
-	dialogErrorH    = 140
-	dialogBtnGap    = 10
-	dialogCloseW    = 92
-	dialogRecheckW  = 108
-	dialogKillW     = 188
-	dialogCancelW   = 88
-	dialogStartW    = 116
+	dialogMarginX       = 24
+	dialogRowH          = 28
+	dialogBtnH          = 36
+	dialogLabelW        = 532
+	dialogProgressH     = 16
+	dialogGroupPad      = 20
+	dialogErrorH        = 140
+	dialogBtnGap        = 10
+	dialogCloseW        = 92
+	dialogRecheckW      = 108
+	dialogKillW         = 188
+	dialogCancelW       = 88
+	dialogStartW        = 116
+	dialogRetryW        = 144
+	dialogSkipW         = 88
+	dialogSkipAllW      = 112
+	dialogOpenFallbackW = 140
+	dialogCopyFallbackW = 140
 )
 
 type bottomButtonSpec struct {
@@ -118,12 +141,15 @@ type bottomButtonSpec struct {
 // NewDialogUI creates a DialogUI without creating the window yet.
 func NewDialogUI(autoConfirm bool) *DialogUI {
 	return &DialogUI{
-		AutoConfirm:     autoConfirm,
-		resultChan:      make(chan bool, 1),
-		doneChan:        make(chan error, 1),
-		postMessageFunc: postMsg,
-		setTextFunc:     setCtrlText,
-		sendMessageFunc: sendMsg,
+		AutoConfirm:          autoConfirm,
+		resultChan:           make(chan bool, 1),
+		doneChan:             make(chan error, 1),
+		postMessageFunc:      postMsg,
+		setTextFunc:          setCtrlText,
+		sendMessageFunc:      sendMsg,
+		foregroundWindowFunc: getForegroundWindow,
+		openURLFunc:          openFallbackURL,
+		copyTextFunc:         copyFallbackText,
 	}
 }
 
@@ -214,6 +240,9 @@ func (ui *DialogUI) RunMessageLoop(work func(context.Context) error, ctx context
 				ui.debugf("message loop dispatch msg=0x%X", m.Message)
 			}
 		}
+		if m.Message == WM_KEYDOWN && ui.handleKeyboardMessage(m.WParam, m.LParam) {
+			continue
+		}
 		translateMsg(&m)
 		dispatchMsg(&m)
 		if ui.Debug {
@@ -251,8 +280,13 @@ func (ui *DialogUI) rebuildFonts(hwnd uintptr) {
 		applyFont(ui.hStatusLbl, ui.fontMedium)
 		applyFont(ui.hStart, ui.font)
 		applyFont(ui.hCancel, ui.font)
+		applyFont(ui.hRetry, ui.font)
+		applyFont(ui.hSkip, ui.font)
+		applyFont(ui.hSkipAll, ui.font)
 		applyFont(ui.hKillProc, ui.font)
 		applyFont(ui.hRecheck, ui.font)
+		applyFont(ui.hOpenFallback, ui.font)
+		applyFont(ui.hCopyFallback, ui.font)
 		applyFont(ui.hCloseBtn, ui.font)
 	}
 	if hwnd != 0 {
@@ -266,6 +300,14 @@ func (ui *DialogUI) startWork() {
 	ui.updateDone = false
 	ui.result = nil
 	ui.exitResult = nil
+	ui.waitingFor = waitNone
+	ui.pendingFileFailure = nil
+	ui.lastFileFailure = nil
+	ui.fileFailureChan = nil
+	ui.fileFailureActive = false
+	ui.fileFailureRendered = false
+	ui.hadFileFailure = false
+	ui.fallbackVisible = false
 	ui.lastUIUpdate = time.Time{} // 重置节流计时器，确保首次进度立即刷新
 	ui.lastProgressPhase = ""     // 重置阶段追踪
 	ui.mu.Unlock()
@@ -335,6 +377,220 @@ func (ui *DialogUI) ConfirmPlan(plan Plan) bool {
 	}
 	ui.debugf("ConfirmPlan waiting on resultChan")
 	return <-ui.resultChan
+}
+
+// DecideFileFailure displays a file failure and waits for one user decision.
+func (ui *DialogUI) DecideFileFailure(ctx context.Context, failure FileFailure) FileFailureDecision {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return FileFailureDecisionCancel
+	}
+
+	ui.mu.Lock()
+	if ui.fileFailureActive {
+		ui.mu.Unlock()
+		return FileFailureDecisionCancel
+	}
+	failureCopy := failure
+	decisionCh := make(chan FileFailureDecision, 1)
+	ui.pendingFileFailure = &failureCopy
+	ui.lastFileFailure = &failureCopy
+	ui.fileFailureChan = decisionCh
+	ui.fileFailureActive = true
+	ui.fileFailureRendered = false
+	ui.hadFileFailure = true
+	ui.waitingFor = waitFileFailure
+	ui.mu.Unlock()
+
+	if ui.hwnd != 0 {
+		ui.postMessageFunc(ui.hwnd, wmAppFileFailure)
+	}
+
+	select {
+	case decision := <-decisionCh:
+		return decision
+	default:
+	}
+	select {
+	case decision := <-decisionCh:
+		return decision
+	case <-ctx.Done():
+		if ui.clearFileFailureWait(decisionCh) {
+			return FileFailureDecisionCancel
+		}
+		// If the UI accepted a decision concurrently, return that decision
+		// rather than turning an already-submitted action into cancellation.
+		select {
+		case decision := <-decisionCh:
+			return decision
+		default:
+			return FileFailureDecisionCancel
+		}
+	}
+}
+
+func (ui *DialogUI) clearFileFailureWait(decisionCh chan FileFailureDecision) bool {
+	ui.mu.Lock()
+	if ui.fileFailureChan == decisionCh && ui.fileFailureActive {
+		ui.fileFailureChan = nil
+		ui.fileFailureActive = false
+		// Keep the pending failure and its rendered state until handleDone so a
+		// cancellation that arrives before wmAppFileFailure is painted still
+		// leaves the original failure visible.
+		ui.waitingFor = waitNone
+		ui.mu.Unlock()
+		return true
+	}
+	ui.mu.Unlock()
+	return false
+}
+
+func fileFailureDecisionAllowed(decision FileFailureDecision, important bool) bool {
+	if important {
+		return decision == FileFailureDecisionRetry || decision == FileFailureDecisionCancel
+	}
+	switch decision {
+	case FileFailureDecisionRetry, FileFailureDecisionSkip, FileFailureDecisionSkipAll, FileFailureDecisionCancel:
+		return true
+	default:
+		return false
+	}
+}
+
+// submitFileFailureDecision is the single decision path shared by buttons and shortcuts.
+func (ui *DialogUI) submitFileFailureDecision(decision FileFailureDecision) bool {
+	ui.mu.Lock()
+	if !ui.fileFailureActive || ui.waitingFor != waitFileFailure || ui.pendingFileFailure == nil || ui.fileFailureChan == nil {
+		ui.mu.Unlock()
+		return false
+	}
+	if !fileFailureDecisionAllowed(decision, ui.pendingFileFailure.Important) {
+		ui.mu.Unlock()
+		return false
+	}
+	decisionCh := ui.fileFailureChan
+	ui.fileFailureChan = nil
+	if decision != FileFailureDecisionCancel {
+		ui.pendingFileFailure = nil
+	}
+	ui.fileFailureActive = false
+	ui.waitingFor = waitNone
+
+	// This method is called by the UI thread for button/keyboard actions. Keep
+	// the state transition, control reset, and channel notification together so
+	// cancellation cannot observe an accepted decision before it is queued, and
+	// the next failure cannot render before the old controls are hidden.
+	ui.resetBottomButtons()
+	select {
+	case decisionCh <- decision:
+	default:
+	}
+	ui.mu.Unlock()
+	return true
+}
+
+func formatFileFailure(failure FileFailure) string {
+	return fmt.Sprintf("文件下载或校验失败：\r\n路径：%s\r\n原因：%s\r\n\r\n请选择下一步：", failure.Path, failure.Error)
+}
+
+func (ui *DialogUI) showFileFailure(failure *FileFailure) {
+	ui.mu.Lock()
+	if !ui.fileFailureActive || ui.fileFailureRendered {
+		ui.mu.Unlock()
+		return
+	}
+	ui.fileFailureRendered = true
+	important := failure.Important
+	ui.mu.Unlock()
+
+	ui.setTextFunc(ui.hFileLbl, "当前文件："+failure.Path)
+	ui.appendError(formatFileFailure(*failure))
+	ui.setStatusWithError("文件下载或校验失败，请选择处理方式。", true)
+	ui.setTextFunc(ui.hRetry, "重试并覆盖（R）")
+	ui.setTextFunc(ui.hSkip, "跳过（S）")
+	ui.setTextFunc(ui.hSkipAll, "跳过全部（A）")
+	ui.setTextFunc(ui.hCancel, "取消（Esc）")
+	if important {
+		ui.showBottomButtons([]bottomButtonSpec{
+			{hwnd: ui.hRetry, width: dialogRetryW},
+			{hwnd: ui.hCancel, width: dialogCancelW},
+		})
+		return
+	}
+	ui.showBottomButtons([]bottomButtonSpec{
+		{hwnd: ui.hRetry, width: dialogRetryW},
+		{hwnd: ui.hSkip, width: dialogSkipW},
+		{hwnd: ui.hSkipAll, width: dialogSkipAllW},
+		{hwnd: ui.hCancel, width: dialogCancelW},
+	})
+}
+
+func (ui *DialogUI) renderPendingFileFailureIfNeeded() {
+	ui.mu.Lock()
+	if !ui.hadFileFailure || ui.fileFailureRendered {
+		ui.mu.Unlock()
+		return
+	}
+	failure := ui.lastFileFailure
+	if failure == nil {
+		failure = ui.pendingFileFailure
+	}
+	if failure == nil {
+		ui.mu.Unlock()
+		return
+	}
+	failureCopy := *failure
+	ui.fileFailureRendered = true
+	ui.mu.Unlock()
+	ui.setTextFunc(ui.hFileLbl, "当前文件："+failureCopy.Path)
+	ui.appendError(formatFileFailure(failureCopy))
+}
+
+func (ui *DialogUI) isWindowForeground() bool {
+	ui.mu.Lock()
+	hwnd := ui.hwnd
+	foregroundWindow := ui.foregroundWindowFunc
+	ui.mu.Unlock()
+	if hwnd == 0 {
+		return false
+	}
+	if foregroundWindow == nil {
+		foregroundWindow = getForegroundWindow
+	}
+	return foregroundWindow() == hwnd
+}
+
+// handleKeyboardMessage consumes failure shortcuts only while this window is foreground.
+func (ui *DialogUI) handleKeyboardMessage(wParam, lParam uintptr) bool {
+	if !ui.isWindowForeground() {
+		return false
+	}
+	if lParam&(uintptr(1)<<30) != 0 {
+		// Consume auto-repeat so it cannot become a decision for a later file.
+		return true
+	}
+
+	var decision FileFailureDecision
+	key := uint32(wParam)
+	if key >= 'a' && key <= 'z' {
+		key -= 'a' - 'A'
+	}
+	switch key {
+	case 'R':
+		decision = FileFailureDecisionRetry
+	case 'S':
+		decision = FileFailureDecisionSkip
+	case 'A':
+		decision = FileFailureDecisionSkipAll
+	case 0x1B: // VK_ESCAPE
+		decision = FileFailureDecisionCancel
+	default:
+		return false
+	}
+	ui.submitFileFailureDecision(decision)
+	return true
 }
 
 // ConfirmProcessTermination shows locked files and waits for user confirmation.
@@ -464,6 +720,11 @@ func (ui *DialogUI) handleMessage(hwnd uintptr, msg uint32, wParam uintptr, lPar
 		ui.createControls(hwnd)
 		return 0
 
+	case WM_KEYDOWN:
+		if ui.handleKeyboardMessage(wParam, lParam) {
+			return 0
+		}
+
 	case WM_PAINT:
 		ui.debugf("handleMessage WM_PAINT")
 	case WM_NCPAINT:
@@ -488,7 +749,19 @@ func (ui *DialogUI) handleMessage(hwnd uintptr, msg uint32, wParam uintptr, lPar
 			default:
 			}
 			return 0
+		case idcRetry:
+			ui.submitFileFailureDecision(FileFailureDecisionRetry)
+			return 0
+		case idcSkip:
+			ui.submitFileFailureDecision(FileFailureDecisionSkip)
+			return 0
+		case idcSkipAll:
+			ui.submitFileFailureDecision(FileFailureDecisionSkipAll)
+			return 0
 		case idcCancel:
+			if ui.submitFileFailureDecision(FileFailureDecisionCancel) {
+				return 0
+			}
 			ui.mu.Lock()
 			cancel := ui.cancelFunc
 			ui.waitingFor = waitNone
@@ -512,10 +785,28 @@ func (ui *DialogUI) handleMessage(hwnd uintptr, msg uint32, wParam uintptr, lPar
 			}
 			return 0
 		case idcRecheck:
-			// 启动新的检查流程
-			ui.requestStartWork()
+			ui.mu.Lock()
+			canRecheck := ui.updateDone && !ui.inUpdate
+			ui.mu.Unlock()
+			if canRecheck {
+				// 启动新的检查流程
+				ui.requestStartWork()
+			}
+			return 0
+		case idcOpenFallback:
+			ui.openFallbackPackage()
+			return 0
+		case idcCopyFallback:
+			ui.copyFallbackPackage()
 			return 0
 		case idcCloseBtn:
+			ui.mu.Lock()
+			fileFailureActive := ui.fileFailureActive && ui.waitingFor == waitFileFailure
+			ui.mu.Unlock()
+			if fileFailureActive {
+				ui.submitFileFailureDecision(FileFailureDecisionCancel)
+				return 0
+			}
 			ui.mu.Lock()
 			ui.waitingFor = waitNone
 			ui.inUpdate = false
@@ -527,8 +818,13 @@ func (ui *DialogUI) handleMessage(hwnd uintptr, msg uint32, wParam uintptr, lPar
 
 	case WM_CLOSE:
 		ui.mu.Lock()
-		canClose := ui.updateDone || !ui.inUpdate
 		waitingFor := ui.waitingFor
+		if waitingFor == waitFileFailure {
+			ui.mu.Unlock()
+			ui.submitFileFailureDecision(FileFailureDecisionCancel)
+			return 0
+		}
+		canClose := ui.updateDone || !ui.inUpdate
 		if canClose {
 			ui.waitingFor = waitNone
 		}
@@ -557,8 +853,21 @@ func (ui *DialogUI) handleMessage(hwnd uintptr, msg uint32, wParam uintptr, lPar
 
 	case WM_DESTROY:
 		ui.mu.Lock()
+		decisionCh := ui.fileFailureChan
+		fileFailureActive := ui.fileFailureActive
+		if fileFailureActive {
+			ui.fileFailureChan = nil
+			ui.fileFailureActive = false
+			ui.fileFailureRendered = false
+		}
 		ui.waitingFor = waitNone
 		ui.mu.Unlock()
+		if fileFailureActive && decisionCh != nil {
+			select {
+			case decisionCh <- FileFailureDecisionCancel:
+			default:
+			}
+		}
 		ui.hwnd = 0
 		postQuit(0)
 		return 0
@@ -647,6 +956,16 @@ func (ui *DialogUI) handleMessage(hwnd uintptr, msg uint32, wParam uintptr, lPar
 
 	case wmAppStartWork:
 		ui.startWork()
+		return 0
+
+	case wmAppFileFailure:
+		ui.mu.Lock()
+		failure := ui.pendingFileFailure
+		active := ui.fileFailureActive
+		ui.mu.Unlock()
+		if failure != nil && active {
+			ui.showFileFailure(failure)
+		}
 		return 0
 
 	case wmAppInfo:
@@ -779,11 +1098,41 @@ func (ui *DialogUI) createControls(hwnd uintptr) {
 	styleButton(ui.hCancel, false)
 	showCtrl(ui.hCancel, swHide)
 
+	ui.hRetry = createControl(hwnd, "BUTTON", 0, idcRetry, dialogMarginX, ui.buttonY, dialogRetryW, dialogBtnH)
+	ui.setTextFunc(ui.hRetry, "重试并覆盖（R）")
+	styleButton(ui.hRetry, false)
+	showCtrl(ui.hRetry, swHide)
+	enableCtrl(ui.hRetry, false)
+
+	ui.hSkip = createControl(hwnd, "BUTTON", 0, idcSkip, dialogMarginX, ui.buttonY, dialogSkipW, dialogBtnH)
+	ui.setTextFunc(ui.hSkip, "跳过（S）")
+	styleButton(ui.hSkip, false)
+	showCtrl(ui.hSkip, swHide)
+	enableCtrl(ui.hSkip, false)
+
+	ui.hSkipAll = createControl(hwnd, "BUTTON", 0, idcSkipAll, dialogMarginX, ui.buttonY, dialogSkipAllW, dialogBtnH)
+	ui.setTextFunc(ui.hSkipAll, "跳过全部（A）")
+	styleButton(ui.hSkipAll, false)
+	showCtrl(ui.hSkipAll, swHide)
+	enableCtrl(ui.hSkipAll, false)
+
 	ui.hStart = createControl(hwnd, "BUTTON", bsDefPushbutton, idcStart, dialogMarginX, ui.buttonY, dialogStartW, dialogBtnH)
 	ui.setTextFunc(ui.hStart, "开始更新")
 	styleButton(ui.hStart, true)
 	enableCtrl(ui.hStart, false)
 	showCtrl(ui.hStart, swHide)
+
+	ui.hOpenFallback = createControl(hwnd, "BUTTON", 0, idcOpenFallback, dialogMarginX, ui.buttonY, dialogOpenFallbackW, dialogBtnH)
+	ui.setTextFunc(ui.hOpenFallback, "打开百度网盘")
+	styleButton(ui.hOpenFallback, false)
+	showCtrl(ui.hOpenFallback, swHide)
+	enableCtrl(ui.hOpenFallback, false)
+
+	ui.hCopyFallback = createControl(hwnd, "BUTTON", 0, idcCopyFallback, dialogMarginX, ui.buttonY, dialogCopyFallbackW, dialogBtnH)
+	ui.setTextFunc(ui.hCopyFallback, "复制下载信息")
+	styleButton(ui.hCopyFallback, false)
+	showCtrl(ui.hCopyFallback, swHide)
+	enableCtrl(ui.hCopyFallback, false)
 
 	ui.rebuildFonts(hwnd)
 
@@ -827,7 +1176,12 @@ func (ui *DialogUI) resetBottomButtons() {
 	buttons := []uintptr{
 		ui.hCloseBtn,
 		ui.hRecheck,
+		ui.hOpenFallback,
+		ui.hCopyFallback,
 		ui.hKillProc,
+		ui.hRetry,
+		ui.hSkip,
+		ui.hSkipAll,
 		ui.hCancel,
 		ui.hStart,
 	}
@@ -862,6 +1216,7 @@ func (ui *DialogUI) showPlan(plan *Plan) {
 	ui.setTextFunc(ui.hLatestLbl, "最新版本："+emptyAsUnknown(plan.LatestVersion))
 	ui.setTextFunc(ui.hCountsLbl, fmt.Sprintf("新增：%d  修改：%d  删除：%d", len(plan.Add), len(plan.Modify), len(plan.Delete)))
 	ui.setTextFunc(ui.hSizeLbl, "下载大小："+formatBytes(plan.DownloadSize))
+	ui.setTextFunc(ui.hCancel, "取消")
 	ui.setStatusWithError("已获取更新计划，请确认是否开始更新。", false)
 	ui.showBottomButtons([]bottomButtonSpec{
 		{hwnd: ui.hStart, width: dialogStartW},
@@ -882,6 +1237,7 @@ func (ui *DialogUI) showLocked(files []LockedFile) {
 	}
 	sb.WriteString("\r\n请点击「关闭相关进程并继续」或「取消」。")
 	ui.appendError(sb.String())
+	ui.setTextFunc(ui.hCancel, "取消")
 	ui.setStatusWithError("检测到文件占用，请先释放相关进程。", true)
 	ui.showBottomButtons([]bottomButtonSpec{
 		{hwnd: ui.hCancel, width: dialogCancelW},
@@ -977,6 +1333,79 @@ func (ui *DialogUI) appendError(text string) {
 	}
 }
 
+func (ui *DialogUI) fallbackCopyContent() string {
+	info := CompletePackageFallback()
+	return fmt.Sprintf("文件名：%s\r\n下载地址：%s\r\n提取码：%s", info.Name, info.URL, info.ExtractCode)
+}
+
+func (ui *DialogUI) showFallbackNotice() {
+	ui.mu.Lock()
+	if ui.fallbackVisible {
+		ui.mu.Unlock()
+		return
+	}
+	ui.fallbackVisible = true
+	ui.mu.Unlock()
+	ui.appendError(FallbackNotice())
+}
+
+func (ui *DialogUI) showFallbackButtons(recheck bool) {
+	buttons := make([]bottomButtonSpec, 0, 4)
+	if recheck {
+		styleButton(ui.hRecheck, true)
+		buttons = append(buttons, bottomButtonSpec{hwnd: ui.hRecheck, width: dialogRecheckW})
+	}
+	buttons = append(buttons,
+		bottomButtonSpec{hwnd: ui.hOpenFallback, width: dialogOpenFallbackW},
+		bottomButtonSpec{hwnd: ui.hCopyFallback, width: dialogCopyFallbackW},
+		bottomButtonSpec{hwnd: ui.hCloseBtn, width: dialogCloseW},
+	)
+	ui.showBottomButtons(buttons)
+}
+
+func (ui *DialogUI) openFallbackPackage() {
+	ui.mu.Lock()
+	visible := ui.fallbackVisible
+	openURL := ui.openURLFunc
+	ui.mu.Unlock()
+	if !visible {
+		return
+	}
+	if openURL == nil {
+		openURL = openFallbackURL
+	}
+	info := CompletePackageFallback()
+	if err := openURL(info.URL); err != nil {
+		ui.appendError(fmt.Sprintf("打开百度网盘失败：%v", err))
+	}
+}
+
+func (ui *DialogUI) copyFallbackPackage() {
+	ui.mu.Lock()
+	visible := ui.fallbackVisible
+	copyText := ui.copyTextFunc
+	ui.mu.Unlock()
+	if !visible {
+		return
+	}
+	if copyText == nil {
+		copyText = copyFallbackText
+	}
+	if err := copyText(ui.fallbackCopyContent()); err != nil {
+		ui.appendError(fmt.Sprintf("复制下载信息失败：%v", err))
+		return
+	}
+	ui.setStatusWithError("已复制完整包下载信息。", false)
+}
+
+func partialResultStatus(result error) string {
+	summary := strings.TrimSpace(SkippedSummary(result))
+	if summary == "" {
+		return "更新部分完成：有文件被跳过，下次检查将继续重试。"
+	}
+	return "更新部分完成：" + summary + "；下次检查将继续重试。"
+}
+
 // handleDone is called when the work goroutine finishes.
 func (ui *DialogUI) handleDone() {
 	if ui.hwnd == 0 {
@@ -985,45 +1414,71 @@ func (ui *DialogUI) handleDone() {
 	debugLog(ui.Debug, "handleDone entered")
 	ui.mu.Lock()
 	result := ui.result
+	hadFileFailure := ui.hadFileFailure
 	ui.mu.Unlock()
 
 	ui.resetBottomButtons()
 
-	if result == ErrSelfUpdateHandoff {
+	if errors.Is(result, ErrSelfUpdateHandoff) {
+		ui.mu.Lock()
+		ui.fallbackVisible = false
+		ui.mu.Unlock()
 		destroyWin(ui.hwnd)
 		return
 	}
 
+	showFallback := ShouldShowFallback(result, hadFileFailure)
+	if !showFallback {
+		ui.mu.Lock()
+		ui.fallbackVisible = false
+		ui.mu.Unlock()
+	}
+	if showFallback || errors.Is(result, ErrUserCancelled) {
+		ui.renderPendingFileFailureIfNeeded()
+	}
+	recheck := false
 	switch {
 	case result == nil:
 		ui.setStatusWithError("更新完成。", false)
 		styleButton(ui.hCloseBtn, true)
-		ui.showBottomButtons([]bottomButtonSpec{{hwnd: ui.hCloseBtn, width: dialogCloseW}})
-	case result == ErrMissingConfig:
+	case errors.Is(result, ErrMissingConfig):
 		ui.setStatusWithError("未找到可用配置。", false)
+		if result != nil {
+			ui.appendError(result.Error())
+		}
 		styleButton(ui.hCloseBtn, true)
-		ui.showBottomButtons([]bottomButtonSpec{{hwnd: ui.hCloseBtn, width: dialogCloseW}})
-	case result == ErrUserCancelled:
+	case errors.Is(result, ErrUserCancelled):
 		ui.setStatusWithError("用户已取消更新。", false)
+		recheck = true
 		styleButton(ui.hCloseBtn, false)
-		styleButton(ui.hRecheck, true)
-		ui.showBottomButtons([]bottomButtonSpec{
-			{hwnd: ui.hRecheck, width: dialogRecheckW},
-			{hwnd: ui.hCloseBtn, width: dialogCloseW},
-		})
-	case result == ErrNoUpdate:
+	case errors.Is(result, ErrNoUpdate):
 		ui.setStatusWithError("当前已是最新版本。", false)
 		styleButton(ui.hCloseBtn, true)
-		ui.showBottomButtons([]bottomButtonSpec{{hwnd: ui.hCloseBtn, width: dialogCloseW}})
-	default:
-		ui.setStatusWithError("更新失败。", true) // 红底红字 (匹配 .status-alert)
+	case errors.Is(result, ErrUpdatePartial):
+		ui.setStatusWithError(partialResultStatus(result), true)
 		ui.appendError(result.Error())
+		recheck = true
 		styleButton(ui.hCloseBtn, false)
+	default:
+		ui.setStatusWithError("更新失败。", true) // 红底红字 (匹配 status-alert)
+		if result != nil {
+			ui.appendError(result.Error())
+		}
+		recheck = true
+		styleButton(ui.hCloseBtn, false)
+	}
+
+	if showFallback {
+		ui.showFallbackNotice()
+		ui.showFallbackButtons(recheck)
+	} else if recheck {
 		styleButton(ui.hRecheck, true)
 		ui.showBottomButtons([]bottomButtonSpec{
 			{hwnd: ui.hRecheck, width: dialogRecheckW},
 			{hwnd: ui.hCloseBtn, width: dialogCloseW},
 		})
+	} else {
+		ui.showBottomButtons([]bottomButtonSpec{{hwnd: ui.hCloseBtn, width: dialogCloseW}})
 	}
 	debugLog(ui.Debug, "handleDone exited, result=%v", result)
 }

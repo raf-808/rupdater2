@@ -173,10 +173,25 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 		return ErrUserCancelled
 	}
 
-	if err := stageFiles(ctx, rootDir, stateDir, latest.FilesBaseURL, opts.Client, opts.Workers, plan, ui); err != nil {
+	stageResult, err := stageFiles(ctx, rootDir, stateDir, latest.FilesBaseURL, opts.Client, opts.Workers, plan, ui)
+	if err != nil {
 		cleanupBeforeRootChange(stateDir)
 		return err
 	}
+	plan = stageResult.EffectivePlan
+	skipped := stageResult.Skipped
+	var partialManifest Manifest
+	if len(skipped) > 0 {
+		partialManifest, err = buildPartialInstalledManifestWithSkipped(installed, plan, skipped, version.Version)
+		if err != nil {
+			cleanupBeforeRootChange(stateDir)
+			return err
+		}
+	}
+
+	// Stage decisions can remove files from the transaction. Rebuild the
+	// session before any operation can touch the installation root.
+	session = newSession(plan)
 	if err := writeSession(stateDir, session, "OccupancyCheck"); err != nil {
 		return err
 	}
@@ -215,6 +230,18 @@ func runUpdate(ctx context.Context, rootDir, stateDir, exePath string, opts Opti
 	if err := ctx.Err(); err != nil {
 		_ = recoverFromSession(stateDir, rootDir, session, ui)
 		return ErrUserCancelled
+	}
+
+	if len(skipped) > 0 {
+		sessionRemoved, err := commitPartialWithProgress(stateDir, partialManifest, skipped, ui, opts.Debug)
+		if err != nil {
+			if !sessionRemoved {
+				_ = recoverFromSession(stateDir, rootDir, session, ui)
+			}
+			return err
+		}
+		ui.Info(fmt.Sprintf("更新部分完成：有 %d 个文件被跳过，下次检查将继续重试。", len(skipped)))
+		return NewUpdatePartialError(skipped)
 	}
 
 	ui.Progress(ProgressEvent{Phase: "Commit"})
@@ -374,24 +401,134 @@ func writeSession(stateDir string, session Session, phase string) error {
 	return WriteJSONAtomic(filepath.Join(stateDir, "session.json"), session)
 }
 
-func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, client *http.Client, workers int, plan Plan, ui UI) error {
+type stageOutcomeStatus uint8
+
+const (
+	stageDownloaded stageOutcomeStatus = iota + 1
+	stageFailed
+	stageCancelled
+	stageSkipped
+)
+
+type stageOutcome struct {
+	index  int
+	entry  FileEntry
+	status stageOutcomeStatus
+	err    error
+}
+
+func isImportantFile(rawPath string) bool {
+	normalized, err := NormalizeManifestPath(rawPath)
+	if err != nil {
+		return false
+	}
+	for _, special := range []string{"manifest.json", "latest.json", "updater-policy.json"} {
+		if stringsEqualFold(normalized, special) {
+			return true
+		}
+	}
+	base := normalized
+	if slash := strings.LastIndexByte(base, '/'); slash >= 0 {
+		base = base[slash+1:]
+	}
+	if dot := strings.LastIndexByte(base, '.'); dot >= 0 && dot < len(base)-1 {
+		ext := base[dot:]
+		for _, importantExt := range []string{".dll", ".exe", ".usf", ".ush"} {
+			if stringsEqualFold(ext, importantExt) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isRequiredFile(path string) bool { return isImportantFile(path) }
+
+func normalizeStageEntries(entries []FileEntry) ([]FileEntry, error) {
+	if entries == nil {
+		return nil, nil
+	}
+	normalized := make([]FileEntry, len(entries))
+	copy(normalized, entries)
+	for i := range normalized {
+		path, err := NormalizeManifestPath(normalized[i].Path)
+		if err != nil {
+			return nil, err
+		}
+		normalized[i].Path = path
+	}
+	return normalized, nil
+}
+
+func normalizeStagePlan(plan Plan) (Plan, error) {
+	var err error
+	if plan.Add, err = normalizeStageEntries(plan.Add); err != nil {
+		return Plan{}, err
+	}
+	if plan.Modify, err = normalizeStageEntries(plan.Modify); err != nil {
+		return Plan{}, err
+	}
+	if plan.Delete, err = normalizeStageEntries(plan.Delete); err != nil {
+		return Plan{}, err
+	}
+	return plan, nil
+}
+
+func stateStagingPath(stateDir, rel string) (string, error) {
+	normalized, err := NormalizeManifestPath(rel)
+	if err != nil {
+		return "", err
+	}
+	base := filepath.Join(stateDir, "staging")
+	target := filepath.Join(base, filepath.FromSlash(normalized))
+	if err := ensureInside(base, target); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+func stateRollbackPath(stateDir, rel string) (string, error) {
+	normalized, err := NormalizeManifestPath(rel)
+	if err != nil {
+		return "", err
+	}
+	base := filepath.Join(stateDir, "rollback")
+	target := filepath.Join(base, filepath.FromSlash(normalized))
+	if err := ensureInside(base, target); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, client *http.Client, workers int, plan Plan, ui UI) (StageResult, error) {
+	if err := ctx.Err(); err != nil {
+		return StageResult{}, ErrUserCancelled
+	}
+	plan, err := normalizeStagePlan(plan)
+	if err != nil {
+		return StageResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return StageResult{}, ErrUserCancelled
+	}
+	result := StageResult{EffectivePlan: plan}
 	entries := append([]FileEntry{}, plan.Add...)
 	entries = append(entries, plan.Modify...)
 	if len(entries) == 0 {
-		return nil
+		return result, nil
+	}
+	if workers <= 0 {
+		workers = 1
+	}
+	if client == nil {
+		client = defaultHTTPClient()
 	}
 
 	stagingDir := filepath.Join(stateDir, "staging")
-	
-	// 确保 staging 目录存在
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
-		return err
+		return StageResult{}, err
 	}
-
-	// 清理临时文件（上次下载中断留下的 .download 文件）
 	cleanupStagingTempFiles(stagingDir)
-
-	// 清理不再需要的文件（不在当前 manifest 中的文件）
 	cleanupStagingOrphans(stagingDir, entries, rootDir)
 
 	var bytesTotal int64
@@ -399,11 +536,12 @@ func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, cli
 		bytesTotal += entry.Size
 	}
 
-	type job struct {
+	type stageJob struct {
+		index int
 		entry FileEntry
 	}
-	jobs := make(chan job)
-	errs := make(chan error, len(entries))
+	jobs := make(chan stageJob)
+	outcomesCh := make(chan stageOutcome, len(entries))
 	var wg sync.WaitGroup
 	var progressMu sync.Mutex
 	var completed int32
@@ -413,89 +551,101 @@ func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, cli
 	lastSpeedBytes := int64(0)
 	speed := float64(0)
 
+	reportCached := func(entry FileEntry) {
+		progressMu.Lock()
+		completedCount := atomic.AddInt32(&completed, 1)
+		newBytesDone := atomic.AddInt64(&bytesDone, entry.Size)
+		ui.Progress(ProgressEvent{
+			Phase:          "Stage",
+			CurrentFile:    entry.Path + " (已缓存)",
+			CompletedFiles: int(completedCount),
+			TotalFiles:     len(entries),
+			BytesDone:      newBytesDone,
+			BytesTotal:     bytesTotal,
+			SpeedBytes:     0,
+		})
+		progressMu.Unlock()
+	}
+
+	progressFor := func(entry FileEntry) func(int64) {
+		return func(n int64) {
+			done := atomic.AddInt64(&bytesDone, n)
+			now := time.Now()
+			progressMu.Lock()
+			if now.Sub(lastProgress) >= 200*time.Millisecond {
+				lastProgress = now
+				elapsed := now.Sub(lastSpeedTime).Seconds()
+				if elapsed > 0 {
+					speed = float64(done-lastSpeedBytes) / elapsed
+				}
+				lastSpeedTime = now
+				lastSpeedBytes = done
+				ui.Progress(ProgressEvent{
+					Phase:          "Stage",
+					CurrentFile:    entry.Path,
+					CompletedFiles: int(atomic.LoadInt32(&completed)),
+					TotalFiles:     len(entries),
+					BytesDone:      done,
+					BytesTotal:     bytesTotal,
+					SpeedBytes:     speed,
+				})
+			}
+			progressMu.Unlock()
+		}
+	}
+
+	runEntry := func(runCtx context.Context, entry FileEntry) error {
+		dest, err := stateStagingPath(stateDir, entry.Path)
+		if err != nil {
+			return err
+		}
+		ok, err := VerifyFile(dest, entry)
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("验证已存在文件失败：%s：%w", entry.Path, err)
+		}
+		if ok {
+			reportCached(entry)
+			return nil
+		}
+		rawURL, err := fileDownloadURL(filesBaseURL, entry.Path)
+		if err != nil {
+			return fmt.Errorf("构造下载地址失败：%s：%w", entry.Path, err)
+		}
+		if err := downloadAndVerify(runCtx, client, rawURL, dest, entry, progressFor(entry)); err != nil {
+			return fmt.Errorf("下载失败：%s：%w", entry.Path, err)
+		}
+		progressMu.Lock()
+		completedCount := atomic.AddInt32(&completed, 1)
+		ui.Progress(ProgressEvent{
+			Phase:          "Stage",
+			CurrentFile:    entry.Path,
+			CompletedFiles: int(completedCount),
+			TotalFiles:     len(entries),
+			BytesDone:      atomic.LoadInt64(&bytesDone),
+			BytesTotal:     bytesTotal,
+			SpeedBytes:     speed,
+		})
+		progressMu.Unlock()
+		return nil
+	}
+
 	worker := func() {
 		defer wg.Done()
 		for item := range jobs {
 			if ctx.Err() != nil {
-				return
+				outcomesCh <- stageOutcome{index: item.index, entry: item.entry, status: stageCancelled}
+				continue
 			}
-			dest, err := stagingPath(rootDir, item.entry.Path)
+			err := runEntry(ctx, item.entry)
 			if err != nil {
-				errs <- err
-				continue
-			}
-			
-			// 检查文件是否已存在且验证通过
-			ok, err := VerifyFile(dest, item.entry)
-			if err != nil && !os.IsNotExist(err) {
-				errs <- fmt.Errorf("验证已存在文件失败：%s：%w", item.entry.Path, err)
-				continue
-			}
-			
-			if ok {
-				// 文件已存在且验证通过，跳过下载，直接更新进度
-				progressMu.Lock()
-				completed++
-				newBytesDone := atomic.AddInt64(&bytesDone, item.entry.Size)
-				ui.Progress(ProgressEvent{
-					Phase:          "Stage",
-					CurrentFile:    item.entry.Path + " (已缓存)",
-					CompletedFiles: int(completed),
-					TotalFiles:     len(entries),
-					BytesDone:      newBytesDone,
-					BytesTotal:     bytesTotal,
-					SpeedBytes:     0, // 已缓存文件不计入下载速度
-				})
-				progressMu.Unlock()
-				continue
-			}
-			
-			// 文件不存在或验证失败，执行下载
-			rawURL, err := fileDownloadURL(filesBaseURL, item.entry.Path)
-			if err != nil {
-				errs <- err
-				continue
-			}
-			progressCb := func(n int64) {
-				done := atomic.AddInt64(&bytesDone, n)
-				now := time.Now()
-				progressMu.Lock()
-				if now.Sub(lastProgress) >= 200*time.Millisecond {
-					lastProgress = now
-					elapsed := now.Sub(lastSpeedTime).Seconds()
-					if elapsed > 0 {
-						speed = float64(done-lastSpeedBytes) / elapsed
-					}
-					lastSpeedTime = now
-					lastSpeedBytes = done
-					ui.Progress(ProgressEvent{
-						Phase:          "Stage",
-						CurrentFile:    item.entry.Path,
-						CompletedFiles: int(completed),
-						TotalFiles:     len(entries),
-						BytesDone:      done,
-						BytesTotal:     bytesTotal,
-						SpeedBytes:     speed,
-					})
+				if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+					outcomesCh <- stageOutcome{index: item.index, entry: item.entry, status: stageCancelled, err: err}
+				} else {
+					outcomesCh <- stageOutcome{index: item.index, entry: item.entry, status: stageFailed, err: err}
 				}
-				progressMu.Unlock()
-			}
-			if err := downloadAndVerify(ctx, client, rawURL, dest, item.entry, progressCb); err != nil {
-				errs <- fmt.Errorf("下载失败：%s：%w", item.entry.Path, err)
 				continue
 			}
-			progressMu.Lock()
-			completed++
-			ui.Progress(ProgressEvent{
-				Phase:          "Stage",
-				CurrentFile:    item.entry.Path,
-				CompletedFiles: int(completed),
-				TotalFiles:     len(entries),
-				BytesDone:      atomic.LoadInt64(&bytesDone),
-				BytesTotal:     bytesTotal,
-				SpeedBytes:     speed,
-			})
-			progressMu.Unlock()
+			outcomesCh <- stageOutcome{index: item.index, entry: item.entry, status: stageDownloaded}
 		}
 	}
 
@@ -503,18 +653,214 @@ func stageFiles(ctx context.Context, rootDir, stateDir, filesBaseURL string, cli
 		wg.Add(1)
 		go worker()
 	}
-	for _, entry := range entries {
-		jobs <- job{entry: entry}
+	for index, entry := range entries {
+		select {
+		case jobs <- stageJob{index: index, entry: entry}:
+		case <-ctx.Done():
+		}
+		if ctx.Err() != nil {
+			break
+		}
 	}
 	close(jobs)
 	wg.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			return err
+	close(outcomesCh)
+
+	outcomes := make([]stageOutcome, len(entries))
+	received := make([]bool, len(entries))
+	for outcome := range outcomesCh {
+		if outcome.index >= 0 && outcome.index < len(outcomes) {
+			outcomes[outcome.index] = outcome
+			received[outcome.index] = true
 		}
 	}
-	return nil
+	if ctx.Err() != nil {
+		return StageResult{}, ErrUserCancelled
+	}
+	for index := range entries {
+		if !received[index] {
+			return StageResult{}, fmt.Errorf("Stage 未返回文件结果：%s", entries[index].Path)
+		}
+		if outcomes[index].status == stageCancelled {
+			return StageResult{}, ErrUserCancelled
+		}
+	}
+
+	requiredFailures := make([]int, 0)
+	ordinaryFailures := make([]int, 0)
+	for index, outcome := range outcomes {
+		if outcome.status != stageFailed {
+			continue
+		}
+		if isImportantFile(outcome.entry.Path) {
+			requiredFailures = append(requiredFailures, index)
+		} else {
+			ordinaryFailures = append(ordinaryFailures, index)
+		}
+	}
+
+	failureUI, interactive := ui.(FileFailureUI)
+	if !interactive {
+		if len(requiredFailures) > 0 {
+			return StageResult{}, stageOutcomeError(outcomes[requiredFailures[0]])
+		}
+		if len(ordinaryFailures) > 0 {
+			return StageResult{}, stageOutcomeError(outcomes[ordinaryFailures[0]])
+		}
+	}
+
+	for _, index := range requiredFailures {
+		outcome := &outcomes[index]
+		resolved := false
+		for !resolved {
+			if err := ctx.Err(); err != nil {
+				return StageResult{}, ErrUserCancelled
+			}
+			decision := failureUI.DecideFileFailure(ctx, stageFileFailure(*outcome))
+			if err := ctx.Err(); err != nil {
+				return StageResult{}, ErrUserCancelled
+			}
+			switch decision {
+			case FileFailureDecisionRetry:
+				err := runEntry(ctx, outcome.entry)
+				if err == nil {
+					if ctx.Err() != nil {
+						return StageResult{}, ErrUserCancelled
+					}
+					outcome.status = stageDownloaded
+					outcome.err = nil
+					resolved = true
+					continue
+				}
+				if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+					return StageResult{}, ErrUserCancelled
+				}
+				outcome.err = err
+			case FileFailureDecisionCancel:
+				return StageResult{}, ErrUserCancelled
+			default:
+				return StageResult{}, stageOutcomeError(*outcome)
+			}
+		}
+	}
+
+	var skipped []SkippedFile
+	skipAll := false
+	for _, index := range ordinaryFailures {
+		outcome := &outcomes[index]
+		if skipAll {
+			outcome.status = stageSkipped
+			skipped = append(skipped, skippedFileFromOutcome(*outcome))
+			continue
+		}
+		resolved := false
+		for !resolved {
+			if err := ctx.Err(); err != nil {
+				return StageResult{}, ErrUserCancelled
+			}
+			decision := failureUI.DecideFileFailure(ctx, stageFileFailure(*outcome))
+			if err := ctx.Err(); err != nil {
+				return StageResult{}, ErrUserCancelled
+			}
+			switch decision {
+			case FileFailureDecisionRetry:
+				err := runEntry(ctx, outcome.entry)
+				if err == nil {
+					if ctx.Err() != nil {
+						return StageResult{}, ErrUserCancelled
+					}
+					outcome.status = stageDownloaded
+					outcome.err = nil
+					resolved = true
+					continue
+				}
+				if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+					return StageResult{}, ErrUserCancelled
+				}
+				outcome.err = err
+			case FileFailureDecisionSkip:
+				outcome.status = stageSkipped
+				skipped = append(skipped, skippedFileFromOutcome(*outcome))
+				resolved = true
+			case FileFailureDecisionSkipAll:
+				outcome.status = stageSkipped
+				skipped = append(skipped, skippedFileFromOutcome(*outcome))
+				skipAll = true
+				resolved = true
+			case FileFailureDecisionCancel:
+				return StageResult{}, ErrUserCancelled
+			default:
+				return StageResult{}, stageOutcomeError(*outcome)
+			}
+		}
+	}
+
+	result.EffectivePlan = effectivePlanFromStage(plan, outcomes, skipped)
+	result.Skipped = skipped
+	return result, nil
+}
+
+func stageOutcomeError(outcome stageOutcome) error {
+	if outcome.err != nil {
+		return outcome.err
+	}
+	return fmt.Errorf("文件处理失败：%s", outcome.entry.Path)
+}
+
+func stageFileFailure(outcome stageOutcome) FileFailure {
+	failure := FileFailure{
+		Path:      outcome.entry.Path,
+		Important: isImportantFile(outcome.entry.Path),
+	}
+	if outcome.err != nil {
+		failure.Error = outcome.err.Error()
+	}
+	return failure
+}
+
+func skippedFileFromOutcome(outcome stageOutcome) SkippedFile {
+	skipped := SkippedFile{Path: outcome.entry.Path}
+	if outcome.err != nil {
+		skipped.Error = outcome.err.Error()
+	}
+	return skipped
+}
+
+func effectivePlanFromStage(plan Plan, outcomes []stageOutcome, skipped []SkippedFile) Plan {
+	result := plan
+	successful := make(map[string]bool, len(outcomes))
+	for _, outcome := range outcomes {
+		if outcome.status == stageDownloaded {
+			successful[manifestKey(outcome.entry.Path)] = true
+		}
+	}
+	result.Add = filterSuccessfulEntries(plan.Add, successful)
+	result.Modify = filterSuccessfulEntries(plan.Modify, successful)
+	result.Delete = append([]FileEntry(nil), plan.Delete...)
+	if len(skipped) > 0 {
+		result.Delete = nil
+	}
+	result.DownloadSize = 0
+	for _, entry := range result.Add {
+		result.DownloadSize += entry.Size
+	}
+	for _, entry := range result.Modify {
+		result.DownloadSize += entry.Size
+	}
+	return result
+}
+
+func filterSuccessfulEntries(entries []FileEntry, successful map[string]bool) []FileEntry {
+	if entries == nil {
+		return nil
+	}
+	filtered := make([]FileEntry, 0, len(entries))
+	for _, entry := range entries {
+		if successful[manifestKey(entry.Path)] {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }
 
 func occupancyCheck(rootDir string, plan Plan, exePath string, ui UI) error {
@@ -578,7 +924,7 @@ func backupFiles(rootDir, stateDir string, plan Plan, exePath string, session *S
 		if _, err := os.Stat(source); errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		backup, err := rollbackPath(rootDir, entry.Path)
+		backup, err := stateRollbackPath(stateDir, entry.Path)
 		if err != nil {
 			return err
 		}
@@ -604,7 +950,7 @@ func switchFiles(rootDir, stateDir string, plan Plan, exePath string, session *S
 	entries := append([]FileEntry{}, plan.Add...)
 	entries = append(entries, plan.Modify...)
 	for _, entry := range entries {
-		staged, err := stagingPath(rootDir, entry.Path)
+		staged, err := stateStagingPath(stateDir, entry.Path)
 		if err != nil {
 			return err
 		}
@@ -648,6 +994,90 @@ func switchFiles(rootDir, stateDir string, plan Plan, exePath string, session *S
 		}
 	}
 	return nil
+}
+
+func buildPartialInstalledManifest(installed *Manifest, plan Plan, version string) (Manifest, error) {
+	return buildPartialInstalledManifestWithSkipped(installed, plan, nil, version)
+}
+
+func buildPartialInstalledManifestWithSkipped(installed *Manifest, plan Plan, skipped []SkippedFile, version string) (Manifest, error) {
+	entries := make(map[string]FileEntry)
+	if installed != nil {
+		_, installedEntries, err := NormalizeManifest(*installed)
+		if err != nil {
+			return Manifest{}, err
+		}
+		entries = installedEntries
+	}
+
+	skippedKeys := make(map[string]struct{}, len(skipped))
+	for _, skippedFile := range skipped {
+		normalizedPath, err := NormalizeManifestPath(skippedFile.Path)
+		if err != nil {
+			return Manifest{}, err
+		}
+		skippedKeys[manifestKey(normalizedPath)] = struct{}{}
+	}
+
+	// A first-install recovery may have remote files that were already valid
+	// on disk and therefore never appeared in Plan.Add. Include those entries,
+	// but never turn a skipped Add into an installed entry. Existing entries
+	// remain authoritative for preserved user files and skipped modifications.
+	if len(plan.RemoteManifest.Files) > 0 {
+		remote, _, err := NormalizeManifest(plan.RemoteManifest)
+		if err != nil {
+			return Manifest{}, err
+		}
+		for _, entry := range remote.Files {
+			key := manifestKey(entry.Path)
+			if _, wasSkipped := skippedKeys[key]; wasSkipped {
+				continue
+			}
+			if _, exists := entries[key]; !exists {
+				entries[key] = entry
+			}
+		}
+	}
+
+	for _, entry := range append(append([]FileEntry{}, plan.Add...), plan.Modify...) {
+		normalizedPath, err := NormalizeManifestPath(entry.Path)
+		if err != nil {
+			return Manifest{}, err
+		}
+		entry.Path = normalizedPath
+		entries[manifestKey(normalizedPath)] = entry
+	}
+
+	files := make([]FileEntry, 0, len(entries))
+	for _, entry := range entries {
+		files = append(files, entry)
+	}
+	sortEntries(files)
+	return Manifest{Version: version, Files: files}, nil
+}
+
+func commitPartialWithProgress(stateDir string, manifest Manifest, skipped []SkippedFile, ui UI, debug bool) (bool, error) {
+	if ui != nil {
+		ui.Progress(ProgressEvent{Phase: "Commit", CurrentFile: "正在规范化部分安装清单"})
+	}
+	normalized, _, err := NormalizeManifest(manifest)
+	if err != nil {
+		return false, err
+	}
+	if err := os.Remove(filepath.Join(stateDir, "session.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	debugLog(debug, "partial commit: write installed_manifest start")
+	if ui != nil {
+		ui.Progress(ProgressEvent{Phase: "Commit", CurrentFile: "正在写入部分 installed_manifest.json"})
+	}
+	if err := WriteJSONAtomic(filepath.Join(stateDir, "installed_manifest.json"), normalized); err != nil {
+		cleanupAfterCommit(stateDir)
+		return true, NewUpdatePartialError(skipped, err)
+	}
+	debugLog(debug, "partial commit: write installed_manifest done")
+	cleanupAfterCommit(stateDir)
+	return true, nil
 }
 
 func commit(stateDir string, manifest Manifest, version string) error {
@@ -723,12 +1153,16 @@ func cleanupStagingTempFiles(stagingDir string) {
 }
 
 // cleanupStagingOrphans 清理 staging 目录中不在当前 manifest 中的文件
-func cleanupStagingOrphans(stagingDir string, entries []FileEntry, rootDir string) {
+func cleanupStagingOrphans(stagingDir string, entries []FileEntry, _ string) {
 	// 构建期望的文件路径集合
 	expected := make(map[string]bool)
 	for _, entry := range entries {
-		staged, err := stagingPath(rootDir, entry.Path)
+		normalized, err := NormalizeManifestPath(entry.Path)
 		if err != nil {
+			continue
+		}
+		staged := filepath.Join(stagingDir, filepath.FromSlash(normalized))
+		if err := ensureInside(stagingDir, staged); err != nil {
 			continue
 		}
 		expected[staged] = true

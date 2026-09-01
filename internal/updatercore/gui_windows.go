@@ -30,6 +30,7 @@ const (
 	WM_SIZE             = 0x0005
 	WM_PAINT            = 0x000F
 	WM_CLOSE            = 0x0010
+	WM_KEYDOWN          = 0x0100
 	WM_COMMAND          = 0x0111
 	WM_ERASEBKGND       = 0x0014
 	WM_WINDOWPOSCHANGED = 0x0047
@@ -46,14 +47,15 @@ const (
 
 // Custom messages for worker -> UI communication
 const (
-	wmAppProgress  = WM_APP + 1
-	wmAppInfo      = WM_APP + 2
-	wmAppError     = WM_APP + 3
-	wmAppPlan      = WM_APP + 4
-	wmAppLocked    = WM_APP + 5
-	wmAppDone      = WM_APP + 6
-	wmAppVersion   = WM_APP + 7
-	wmAppStartWork = WM_APP + 8
+	wmAppProgress    = WM_APP + 1
+	wmAppInfo        = WM_APP + 2
+	wmAppError       = WM_APP + 3
+	wmAppPlan        = WM_APP + 4
+	wmAppLocked      = WM_APP + 5
+	wmAppDone        = WM_APP + 6
+	wmAppVersion     = WM_APP + 7
+	wmAppStartWork   = WM_APP + 8
+	wmAppFileFailure = WM_APP + 9
 )
 
 // System commands and styles
@@ -121,6 +123,11 @@ const (
 	idcStatusLbl    = 1019
 	idcVerGroupBox  = 1020
 	idcProgGroupBox = 1021
+	idcRetry        = 1022
+	idcSkip         = 1023
+	idcSkipAll      = 1024
+	idcOpenFallback = 1025
+	idcCopyFallback = 1026
 )
 
 // Font and DPI related constants — 匹配参考设计 15px/500weight 主文本, 14px/600weight 标题按钮
@@ -217,6 +224,7 @@ var (
 	procCreateWindowExW       = user32.NewProc("CreateWindowExW")
 	procShowWindow            = user32.NewProc("ShowWindow")
 	procGetMessageW           = user32.NewProc("GetMessageW")
+	procGetForegroundWindow   = user32.NewProc("GetForegroundWindow")
 	procTranslateMessage      = user32.NewProc("TranslateMessage")
 	procDispatchMessageW      = user32.NewProc("DispatchMessageW")
 	procPostMessageW          = user32.NewProc("PostMessageW")
@@ -485,6 +493,11 @@ func getMessage(m *msg) int32 {
 
 func translateMsg(m *msg) {
 	procTranslateMessage.Call(uintptr(unsafe.Pointer(m)))
+}
+
+func getForegroundWindow() uintptr {
+	hwnd, _, _ := procGetForegroundWindow.Call()
+	return hwnd
 }
 
 func dispatchMsg(m *msg) {

@@ -15,6 +15,7 @@ const (
 
 var (
 	ErrNoUpdate          = errors.New("已是最新版本，无需更新")
+	ErrUpdatePartial     = errors.New("update partially completed")
 	ErrUserCancelled     = errors.New("user cancelled")
 	ErrSelfUpdateHandoff = errors.New("self update handoff started")
 	ErrMissingConfig     = errors.New("missing updater config")
@@ -47,14 +48,14 @@ type VersionState struct {
 }
 
 type Options struct {
-	RootDir     string
-	Silent      bool
-	Debug       bool
-	AutoConfirm bool
-	Workers     int
-	Client      *http.Client
-	UI          UI
-	StateDir    string
+	RootDir      string
+	Silent       bool
+	Debug        bool
+	AutoConfirm  bool
+	Workers      int
+	Client       *http.Client
+	UI           UI
+	StateDir     string
 	KeepStateDir bool
 
 	CompleteSelfUpdate bool
@@ -106,4 +107,44 @@ type ProgressEvent struct {
 	BytesDone      int64
 	BytesTotal     int64
 	SpeedBytes     float64
+}
+
+// FileFailure describes a file that did not pass the existing download and
+// verification attempts. Path is the normalized relative path shown to the
+// user; Error is the user-readable reason for the failure.
+type FileFailure struct {
+	Path      string
+	Error     string
+	Important bool
+}
+
+// FileFailureDecision is the action selected for a failed file.
+type FileFailureDecision string
+
+const (
+	FileFailureDecisionRetry   FileFailureDecision = "retry"
+	FileFailureDecisionSkip    FileFailureDecision = "skip"
+	FileFailureDecisionSkipAll FileFailureDecision = "skip_all"
+	FileFailureDecisionCancel  FileFailureDecision = "cancel"
+
+	// Short names keep the contract convenient for callers that already have
+	// the FileFailureDecision type in scope.
+	FileFailureRetry   = FileFailureDecisionRetry
+	FileFailureSkip    = FileFailureDecisionSkip
+	FileFailureSkipAll = FileFailureDecisionSkipAll
+	FileFailureCancel  = FileFailureDecisionCancel
+)
+
+// SkippedFile records a failed file that the user elected not to install in
+// the current run.
+type SkippedFile struct {
+	Path  string
+	Error string
+}
+
+// StageResult contains the plan that may actually be applied and the files
+// deliberately left for a later run.
+type StageResult struct {
+	EffectivePlan Plan
+	Skipped       []SkippedFile
 }

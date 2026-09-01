@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
 	"updater/internal/updatercore"
@@ -41,18 +41,32 @@ func main() {
 	}
 
 	err := updatercore.Run(context.Background(), opts)
-	switch {
-	case err == nil:
-		return
-	case errors.Is(err, updatercore.ErrSelfUpdateHandoff):
-		return
-	case errors.Is(err, updatercore.ErrNoUpdate):
-		return
-	case errors.Is(err, updatercore.ErrUserCancelled):
-		fmt.Fprintln(os.Stderr, "用户已取消更新。")
-		os.Exit(2)
+	if code := reportResult(err, os.Stderr); code != 0 {
+		os.Exit(code)
+	}
+}
+
+// reportResult is the process result boundary. It writes failure output
+// directly to stderr so Silent mode cannot hide the summary through UI.Info.
+func reportResult(err error, stderr io.Writer) int {
+	result := updatercore.ClassifyResult(err)
+	switch result {
+	case updatercore.ResultSuccess, updatercore.ResultNoUpdate, updatercore.ResultSelfUpdateHandoff:
+		return updatercore.ExitCode(err)
+	case updatercore.ResultCancelled:
+		fmt.Fprintln(stderr, "用户已取消更新。")
+		return updatercore.ExitCode(err)
+	case updatercore.ResultPartial:
+		fmt.Fprintf(stderr, "%v\n", err)
+		if updatercore.ShouldShowFallback(err, false) {
+			updatercore.WriteFallbackNotice(stderr)
+		}
+		return updatercore.ExitCode(err)
 	default:
-		fmt.Fprintf(os.Stderr, "更新失败：%v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "更新失败：%v\n", err)
+		if updatercore.ShouldShowFallback(err, false) {
+			updatercore.WriteFallbackNotice(stderr)
+		}
+		return updatercore.ExitCode(err)
 	}
 }
