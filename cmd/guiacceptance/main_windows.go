@@ -7,10 +7,12 @@ import (
 	"flag"
 	"fmt"
 	"image"
+	"image/color"
 	"image/png"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -246,7 +248,7 @@ func run() error {
 		}
 	}
 
-	needsForeground := *clickText != "" || *focusClass != "" || *key != ""
+	needsForeground := *clickText != "" || *focusClass != "" || *key != "" || *checkOverlap
 	if needsForeground {
 		if err := ensureForeground(hwnd, 3*time.Second); err != nil {
 			return err
@@ -297,6 +299,30 @@ func run() error {
 		time.Sleep(*settle)
 	}
 
+	var visualArtifacts []buttonGapArtifact
+	if *checkOverlap && len(overlaps) == 0 {
+		procDwmFlush.Call()
+		time.Sleep(*settle)
+		controls, err = enumControls(hwnd)
+		if err != nil {
+			return err
+		}
+		img, windowRect, err := captureWindowImage(hwnd)
+		if err != nil {
+			return err
+		}
+		visualArtifacts = findButtonGapArtifacts(img, windowRect, controls)
+		if len(visualArtifacts) == 0 {
+			fmt.Println("button-visual-overlap: PASS")
+		} else {
+			fmt.Printf("button-visual-overlap: FAIL (%d dirty gap(s))\n", len(visualArtifacts))
+			for _, artifact := range visualArtifacts {
+				fmt.Printf("  gap %s has %d/%d non-background pixel(s), background=%v\n",
+					formatRect(artifact.Gap), artifact.DirtyPixels, artifact.TotalPixels, artifact.Background)
+			}
+		}
+	}
+
 	if *screenshot != "" {
 		foreground, _, _ := procGetForegroundWindow.Call()
 		if foreground != hwnd {
@@ -329,7 +355,7 @@ func run() error {
 		}
 	}
 
-	if len(overlaps) > 0 {
+	if len(overlaps) > 0 || len(visualArtifacts) > 0 {
 		return fmt.Errorf("visible button overlap detected")
 	}
 	return nil
@@ -709,38 +735,130 @@ func formatRect(r rect) string {
 	return fmt.Sprintf("[%d,%d]-[%d,%d] %dx%d", r.Left, r.Top, r.Right, r.Bottom, r.width(), r.height())
 }
 
-func captureWindowScreen(hwnd uintptr, output string) error {
+type buttonGapArtifact struct {
+	Gap         rect
+	DirtyPixels int
+	TotalPixels int
+	Background  color.RGBA
+}
+
+func findButtonGapArtifacts(img image.Image, windowRect rect, controls []control) []buttonGapArtifact {
+	buttons := make([]control, 0, len(controls))
+	for _, c := range controls {
+		if !c.Visible || !strings.EqualFold(c.Class, "Button") || c.Rect.width() <= 0 || c.Rect.height() <= 0 || c.Style&0xF == bsGroupBox {
+			continue
+		}
+		buttons = append(buttons, c)
+	}
+	if len(buttons) < 2 {
+		return nil
+	}
+	sort.Slice(buttons, func(i, j int) bool { return buttons[i].Rect.Left < buttons[j].Rect.Left })
+
+	refLeft := buttons[0].Rect.Left - windowRect.Left - 22
+	refRight := buttons[0].Rect.Left - windowRect.Left - 6
+	refTop := buttons[0].Rect.Top - windowRect.Top + 8
+	refBottom := buttons[0].Rect.Bottom - windowRect.Top - 8
+	bounds := img.Bounds()
+	if refLeft < int32(bounds.Min.X) || refRight > int32(bounds.Max.X) || refTop < int32(bounds.Min.Y) || refBottom > int32(bounds.Max.Y) || refLeft >= refRight || refTop >= refBottom {
+		return nil
+	}
+	background := dominantRGBA(img, image.Rect(int(refLeft), int(refTop), int(refRight), int(refBottom)))
+
+	var artifacts []buttonGapArtifact
+	for i := 0; i+1 < len(buttons); i++ {
+		left, right := buttons[i], buttons[i+1]
+		if right.Rect.Left <= left.Rect.Right {
+			continue
+		}
+		gap := rect{Left: left.Rect.Right, Top: max32(left.Rect.Top, right.Rect.Top), Right: right.Rect.Left, Bottom: min32(left.Rect.Bottom, right.Rect.Bottom)}
+		if gap.width() < 4 || gap.height() < 16 {
+			continue
+		}
+		sample := image.Rect(
+			int(gap.Left-windowRect.Left+2), int(gap.Top-windowRect.Top+8),
+			int(gap.Right-windowRect.Left-2), int(gap.Bottom-windowRect.Top-8),
+		).Intersect(bounds)
+		if sample.Empty() {
+			continue
+		}
+		dirty, total := countDifferentPixels(img, sample, background, 8)
+		if total > 0 && dirty*5 > total {
+			artifacts = append(artifacts, buttonGapArtifact{Gap: gap, DirtyPixels: dirty, TotalPixels: total, Background: background})
+		}
+	}
+	return artifacts
+}
+
+func dominantRGBA(img image.Image, area image.Rectangle) color.RGBA {
+	counts := make(map[color.RGBA]int)
+	var best color.RGBA
+	bestCount := -1
+	for y := area.Min.Y; y < area.Max.Y; y++ {
+		for x := area.Min.X; x < area.Max.X; x++ {
+			r, g, b, a := img.At(x, y).RGBA()
+			c := color.RGBA{R: uint8(r >> 8), G: uint8(g >> 8), B: uint8(b >> 8), A: uint8(a >> 8)}
+			counts[c]++
+			if counts[c] > bestCount {
+				best, bestCount = c, counts[c]
+			}
+		}
+	}
+	return best
+}
+
+func countDifferentPixels(img image.Image, area image.Rectangle, background color.RGBA, tolerance uint8) (dirty, total int) {
+	for y := area.Min.Y; y < area.Max.Y; y++ {
+		for x := area.Min.X; x < area.Max.X; x++ {
+			r, g, b, _ := img.At(x, y).RGBA()
+			if channelDiff(uint8(r>>8), background.R) > tolerance || channelDiff(uint8(g>>8), background.G) > tolerance || channelDiff(uint8(b>>8), background.B) > tolerance {
+				dirty++
+			}
+			total++
+		}
+	}
+	return dirty, total
+}
+
+func channelDiff(a, b uint8) uint8 {
+	if a > b {
+		return a - b
+	}
+	return b - a
+}
+
+func captureWindowImage(hwnd uintptr) (*image.RGBA, rect, error) {
 	var r rect
 	ok, _, callErr := procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&r)))
 	if ok == 0 {
-		return fmt.Errorf("GetWindowRect: %w", callErr)
+		return nil, rect{}, fmt.Errorf("GetWindowRect: %w", callErr)
 	}
 	width, height := r.width(), r.height()
 	if width <= 0 || height <= 0 {
-		return fmt.Errorf("invalid window rectangle %s", formatRect(r))
+		return nil, rect{}, fmt.Errorf("invalid window rectangle %s", formatRect(r))
 	}
 
 	desktopDC, _, callErr := procGetDC.Call(0)
 	if desktopDC == 0 {
-		return fmt.Errorf("GetDC(desktop): %w", callErr)
+		return nil, rect{}, fmt.Errorf("GetDC(desktop): %w", callErr)
 	}
 	defer procReleaseDC.Call(0, desktopDC)
 
 	memoryDC, _, callErr := procCreateCompatibleDC.Call(desktopDC)
 	if memoryDC == 0 {
-		return fmt.Errorf("CreateCompatibleDC: %w", callErr)
+		return nil, rect{}, fmt.Errorf("CreateCompatibleDC: %w", callErr)
 	}
 	defer procDeleteDC.Call(memoryDC)
 
 	bitmap, _, callErr := procCreateCompatibleBitmap.Call(desktopDC, uintptr(width), uintptr(height))
 	if bitmap == 0 {
-		return fmt.Errorf("CreateCompatibleBitmap: %w", callErr)
+		return nil, rect{}, fmt.Errorf("CreateCompatibleBitmap: %w", callErr)
 	}
 	defer procDeleteObject.Call(bitmap)
 
 	old, _, callErr := procSelectObject.Call(memoryDC, bitmap)
 	if old == 0 {
-		return fmt.Errorf("SelectObject: %w", callErr)
+		return nil, rect{}, fmt.Errorf("SelectObject: %w", callErr)
 	}
 
 	copied, _, callErr := procBitBlt.Call(
@@ -750,7 +868,7 @@ func captureWindowScreen(hwnd uintptr, output string) error {
 	)
 	procSelectObject.Call(memoryDC, old)
 	if copied == 0 {
-		return fmt.Errorf("BitBlt: %w", callErr)
+		return nil, rect{}, fmt.Errorf("BitBlt: %w", callErr)
 	}
 
 	pixels := make([]byte, int(width)*int(height)*4)
@@ -767,7 +885,7 @@ func captureWindowScreen(hwnd uintptr, output string) error {
 		uintptr(unsafe.Pointer(&info)), dibRGBColors,
 	)
 	if scanLines != uintptr(height) {
-		return fmt.Errorf("GetDIBits returned %d/%d scan lines: %w", scanLines, height, callErr)
+		return nil, rect{}, fmt.Errorf("GetDIBits returned %d/%d scan lines: %w", scanLines, height, callErr)
 	}
 
 	img := image.NewRGBA(image.Rect(0, 0, int(width), int(height)))
@@ -782,6 +900,14 @@ func captureWindowScreen(hwnd uintptr, output string) error {
 		}
 	}
 
+	return img, r, nil
+}
+
+func captureWindowScreen(hwnd uintptr, output string) error {
+	img, _, err := captureWindowImage(hwnd)
+	if err != nil {
+		return err
+	}
 	if dir := filepath.Dir(output); dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err

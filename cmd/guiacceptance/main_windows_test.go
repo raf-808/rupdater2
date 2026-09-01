@@ -3,6 +3,8 @@
 package main
 
 import (
+	"image"
+	"image/color"
 	"testing"
 	"unsafe"
 )
@@ -79,5 +81,49 @@ func TestFindButtonOverlapsIgnoresHiddenAndGroupBox(t *testing.T) {
 	}
 	if got[0][0].ID != 1 || got[0][1].ID != 2 {
 		t.Fatalf("unexpected overlap pair: %#v", got[0])
+	}
+}
+
+func TestFindButtonGapArtifactsDetectsPaintLeftBehindBetweenNonOverlappingButtons(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 180, 90))
+	for y := 0; y < 90; y++ {
+		for x := 0; x < 180; x++ {
+			img.SetRGBA(x, y, color.RGBA{255, 255, 255, 255})
+		}
+	}
+	controls := []control{
+		{ID: 1, Class: "Button", Rect: rect{50, 20, 80, 60}, Visible: true},
+		{ID: 2, Class: "Button", Rect: rect{90, 20, 130, 60}, Visible: true},
+	}
+	for y := 28; y < 52; y++ {
+		for x := 82; x < 88; x++ {
+			img.SetRGBA(x, y, color.RGBA{240, 240, 240, 255})
+		}
+	}
+
+	got := findButtonGapArtifacts(img, rect{0, 0, 180, 90}, controls)
+	if len(got) != 1 {
+		t.Fatalf("findButtonGapArtifacts returned %d artifact(s), want 1: %#v", len(got), got)
+	}
+	if got[0].Gap.Left != 80 || got[0].Gap.Right != 90 {
+		t.Fatalf("unexpected dirty gap: %#v", got[0])
+	}
+}
+
+func TestFindButtonGapArtifactsAcceptsCleanGapAcrossDynamicLayouts(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 240, 100))
+	for y := 0; y < 100; y++ {
+		for x := 0; x < 240; x++ {
+			img.SetRGBA(x, y, color.RGBA{255, 255, 255, 255})
+		}
+	}
+	controls := []control{
+		{ID: 1, Class: "Button", Rect: rect{60, 30, 100, 70}, Visible: true},
+		{ID: 2, Class: "Button", Rect: rect{110, 30, 150, 70}, Visible: true},
+		{ID: 3, Class: "Button", Rect: rect{160, 30, 210, 70}, Visible: true},
+		{ID: 4, Class: "Button", Rect: rect{90, 30, 140, 70}, Visible: false},
+	}
+	if got := findButtonGapArtifacts(img, rect{0, 0, 240, 100}, controls); len(got) != 0 {
+		t.Fatalf("clean dynamic layout reported visual artifacts: %#v", got)
 	}
 }
