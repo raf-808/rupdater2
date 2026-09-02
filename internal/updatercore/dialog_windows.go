@@ -1120,7 +1120,7 @@ func (ui *DialogUI) createControls(hwnd uintptr) {
 	showCtrl(ui.hStart, swHide)
 
 	ui.hOpenFallback = createControl(hwnd, "BUTTON", 0, idcOpenFallback, dialogMarginX, ui.buttonY, dialogOpenFallbackW, dialogBtnH)
-	ui.setTextFunc(ui.hOpenFallback, "打开百度网盘")
+	ui.setTextFunc(ui.hOpenFallback, "打开网盘")
 	styleButton(ui.hOpenFallback, false)
 	showCtrl(ui.hOpenFallback, swHide)
 	enableCtrl(ui.hOpenFallback, false)
@@ -1373,7 +1373,7 @@ func (ui *DialogUI) openFallbackPackage() {
 	}
 	info := CompletePackageFallback()
 	if err := openURL(info.URL); err != nil {
-		ui.appendError(fmt.Sprintf("打开百度网盘失败：%v", err))
+		ui.appendError(fmt.Sprintf("打开网盘失败：%v", err))
 	}
 }
 

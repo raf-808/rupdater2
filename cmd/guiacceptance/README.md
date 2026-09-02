@@ -52,7 +52,7 @@ Click a visible control by caption:
 
 ```powershell
 ..\build\GuiAcceptance.exe -click '跳过（S）'
-..\build\GuiAcceptance.exe -click '打开百度网盘'
+..\build\GuiAcceptance.exe -click '打开网盘'
 ..\build\GuiAcceptance.exe -click '复制下载信息'
 ```
 
