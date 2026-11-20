@@ -390,6 +390,13 @@ func TestDialogUIStartWorkResetsFileFailureState(t *testing.T) {
 	}
 }
 
+// emReplaceSel 桩专用的 kernel32 字符串读取入口。复用 gui_windows.go 的
+// 包级 kernel32 句柄，测试内不另行声明同名 DLL 变量。
+var (
+	testProcLstrlenW = kernel32.NewProc("lstrlenW")
+	testProcLstrcpyW = kernel32.NewProc("lstrcpyW")
+)
+
 func newDialogTextTestUI() (*DialogUI, *string) {
 	ui := newDialogTestUI()
 	ui.hErrorEdit = 77
@@ -408,12 +415,24 @@ func newDialogTextTestUI() (*DialogUI, *string) {
 			return uintptr(len(*text))
 		case emReplaceSel:
 			if lParam != 0 {
-				units := unsafe.Slice((*uint16)(unsafe.Pointer(lParam)), 4096)
-				for i, unit := range units {
-					if unit == 0 {
-						*text += syscall.UTF16ToString(units[:i])
-						break
-					}
+				// 复刻真实编辑控件对 EM_REPLACESEL 的处理：读取 lParam 指向
+				// 的 NUL 结尾 UTF-16 字符串。内存读取经 kernel32 的
+				// lstrlenW/lstrcpyW 完成，与真实控件一致；测试代码不做
+				// uintptr→unsafe.Pointer 回转换，因此 -race（checkptr）下：
+				// 1) 不会触发 checkptrArithmetic 的
+				//    "pointer arithmetic result points to invalid allocation"
+				//    （函数参数里的 uintptr 无法向运行时提供原始指针出处）；
+				// 2) 不会触发 unsafe.Slice 固定 4096 长度的
+				//    "unsafe.Slice result straddles multiple allocations"
+				//    （UTF16PtrFromString 分配远小于 4096×2 字节）。
+				// 断言语义与原实现完全一致：追加至首个 NUL（lstrlenW 即
+				// 首个 NUL 的下标）；若 4096 个单元内无 NUL 则不追加。
+				r1, _, _ := testProcLstrlenW.Call(lParam)
+				length := int32(r1)
+				if length >= 0 && length < 4096 {
+					buf := make([]uint16, length+1)
+					testProcLstrcpyW.Call(uintptr(unsafe.Pointer(&buf[0])), lParam)
+					*text += syscall.UTF16ToString(buf[:length])
 				}
 			}
 		}
